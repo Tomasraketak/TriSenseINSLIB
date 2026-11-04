@@ -1,0 +1,3 @@
+tests/host/build/
+__pycache__/
+*.pyc
