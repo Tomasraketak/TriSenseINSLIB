@@ -209,12 +209,14 @@ dropped below what the filter needs. The examples print a warning.
 
 ### Size
 
-Measured by the CI build (arduino-cli, default board options):
+Measured by the CI build (arduino-cli, arduino-pico, default board options,
+2026-11-04):
 
 | Board | Example | Flash | RAM (static) |
 |---|---|---:|---:|
-| Pico 2 | BasicAttitudeAltitude | _see CI_ | _see CI_ |
-| Pico 2 | GPS_INS | _see CI_ | _see CI_ |
+| Pico 2 | GPS_INS (incl. TinyGPSPlus and the core) | 156 364 B (3 %) | 35 276 B (6 %) |
+
+The other examples are smaller; the CI log of each push lists them all.
 
 The filter state (`nav_suite_t`) is about 15 KB of RAM, and INSLIB's World
 Magnetic Model tables about 11 KB of flash.
