@@ -72,7 +72,8 @@ estimated sensor biases and the uncertainty of all of it.
 | Example | What it shows |
 |---|---|
 | `BasicAttitudeAltitude` | No GNSS: roll / pitch / heading, baro height and vertical speed, 10 Hz |
-| `GPS_INS` | TriSense + Quectel L76K: full navigation, accuracy, biases, CSV mode |
+| `GPS_INS` | TriSense + Quectel L76K over NMEA (L76K-specific PCAS setup): full navigation, accuracy, biases, CSV mode |
+| `GPS_INS_UBLOX` | TriSense + u-blox M10 (or M8/M9) over binary UBX: NAV-PVT at 10 Hz, the receiver's own hAcc/vAcc/sAcc, full 3D NED velocity, airborne dynamic model, UART or I2C. Needs the **SparkFun u-blox GNSS v3** library |
 | `FlightLogger` | Logs what the filter sees; `tools/split_flight_log.py` turns it into an INSLIB dataset for `inspostgui.py` |
 
 ### Wiring (Pico 2, as in the examples)
@@ -83,7 +84,13 @@ TriSense   ICM-42688-P   SPI0, CS = GP17 (SCK GP18, MOSI GP19, MISO GP16)
            BMP580        I2C0
 L76K       module RX  <- GP0  (Pico TX)
            module TX  -> GP1  (Pico RX)
+u-blox M10 same UART pins (GPS_INS_UBLOX), or Qwiic / I2C0 at 0x42
+           with GNSS_USE_I2C 1
 ```
+
+Use `GPS_INS_UBLOX` for a u-blox module. The NMEA `GPS_INS` example sends
+L76K-only `$PCAS` commands; on a u-blox it only works with `GPS_FAST_BAUD` set
+to 9600, at 1 Hz and with HDOP-based accuracy.
 
 ---
 

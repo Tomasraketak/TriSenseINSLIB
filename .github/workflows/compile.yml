@@ -46,6 +46,7 @@ jobs:
             - source-path: ./
             - name: Voltino_TriSense
             - name: TinyGPSPlus
+            - name: SparkFun u-blox GNSS v3
           sketch-paths: |
             - examples
           enable-warnings-report: true
