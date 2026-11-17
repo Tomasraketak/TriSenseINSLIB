@@ -189,6 +189,13 @@ struct TriSenseINSConfig {
   bool  gnssUseCourseAsHeading = false;
   float gnssCourseMinSpeedMps  = 3.0f;
   float gnssCourseSigmaDeg     = 8.0f;
+  // Heading axis: the body (FRD) axis whose compass direction feedHeading()
+  // and the course-over-ground heading refer to. The default, FRD x, makes
+  // that the usual yaw. Such a heading is ignored only while THIS axis points
+  // within ~8 deg of straight up or down - not whenever the pitch is near
+  // +-90 deg. E.g. a rocket that stands on its FRD x axis can take a launch
+  // rail azimuth for an axis across the body (FRD y or z) on the pad.
+  float headingAxis[3] = {1.0f, 0.0f, 0.0f};
   // Geoid separation used when feedGnss() is not given one [m]. NMEA altitude
   // is above mean sea level; INSLIB works in ellipsoid height. Czechia ~ +44 m.
   float geoidSeparationM = 44.0f;
@@ -257,7 +264,8 @@ public:
 
   // Scalar speed from odometry (wheel, airspeed is NOT ground speed) [m/s].
   void feedSpeed(float speedMps, float sigmaMps = 0.0f, uint16_t delayMs = 0);
-  // Absolute heading from an external source (dual-antenna GNSS, ...) [deg].
+  // Absolute heading from an external source (dual-antenna GNSS, ...) [deg]:
+  // the compass direction of TriSenseINSConfig::headingAxis (default FRD x).
   void feedHeading(float headingDeg, float sigmaDeg, uint16_t delayMs = 0);
   // "I know the vehicle is not moving" for the next epoch (e.g. on the launch pad).
   void zeroVelocityUpdate();

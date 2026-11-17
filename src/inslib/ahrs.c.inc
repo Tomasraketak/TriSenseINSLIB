@@ -574,13 +574,23 @@ static void ahrs_mag_detilt(const float mag_b[3], float roll_rad, float pitch_ra
     *hy            = ty;
 }
 
-/* Magnetometer heading (AHRS mode): scalar tilt-compensated heading
- * measurement. Residual z = wrap(yaw_mag - yaw_nominal) = -dyaw, so
- * H = [0 0 -1 0 0 0]. Only yaw is observed, roll/pitch stay untouched by
- * magnetic disturbances. Once a position is known the WMM declination turns the
- * magnetic heading into a true-north heading, and the measured field magnitude
- * is checked against the WMM total field: a gross deviation downweights the
- * sample instead of dropping it. */
+/* Magnetometer heading (AHRS mode): scalar heading measurement taken as the
+ * azimuth of the measured field in the n-frame,
+ *     h_n = R_b_to_n * mag_b,   azimuth = atan2(h_E, h_N),
+ * which with the right attitude points to magnetic north, i.e. equals the WMM
+ * declination once a position is known (zero before). Residual
+ *     z = wrap(declination - azimuth).
+ * The attitude error state of this filter lives in the n-frame (R_nominal =
+ * (I + [dx]_x) R_true, see ins_quat_small_angle_correction): its vertical
+ * component dx_z turns h_n, and with it the azimuth, by exactly dx_z, so
+ * z = -dx_z and H = [0 0 -1 0 0 0] - the same H as the former Euler-yaw
+ * formulation, without the Euler angles. The tilt components would move the
+ * azimuth too (through the dip of the field) but are deliberately left out of
+ * H: roll/pitch stay untouched by magnetic disturbances. With no Euler angle
+ * involved, pitch +/-90 deg is an ordinary attitude; the measurement is only
+ * skipped where the horizontal field itself vanishes (magnetic pole). The
+ * measured field magnitude is checked against the WMM total field: a gross
+ * deviation downweights the sample instead of dropping it. */
 /* @satisfies REQ-AHRS-006 REQ-AHRS-014 REQ-AHRS-015 */
 static void ahrs_fuse_mag(ahrs_t* a, const float mag_b[3])
 {
@@ -605,33 +615,30 @@ static void ahrs_fuse_mag(ahrs_t* a, const float mag_b[3])
     float R_b_to_n[9];
     ins_quat_to_rotmat(a->q, R_b_to_n);
 
-    /* Yaw is ill-defined near pitch = +/-90 deg (gimbal lock) -> skip. */
-    const float sp = -MAT_ELEM(R_b_to_n, 2, 0, 3, 3);
-    if (sp > 0.99f || sp < -0.99f)
+    /* Horizontal part of the field in the n-frame. It must be usable relative
+       to the total field: near a magnetic pole the horizontal component
+       vanishes. */
+    float h_n[2];
+    int   i;
+    for (i = 0; i < 2; ++i)
     {
-        LOG_INFO("ahrs: magnetometer fusion skipped, pitch %.1f deg too close to +/-90 deg",
-                 (double)RAD2DEG(asinf(sp)));
-        return;
+        h_n[i] = MAT_ELEM(R_b_to_n, i, 0, 3, 3) * mag_b[0] +
+                 MAT_ELEM(R_b_to_n, i, 1, 3, 3) * mag_b[1] +
+                 MAT_ELEM(R_b_to_n, i, 2, 3, 3) * mag_b[2];
     }
-
-    float roll, pitch, yaw_nom;
-    ins_rotmat_to_rpy(R_b_to_n, &roll, &pitch, &yaw_nom);
-
-    /* De-tilted horizontal field must be usable (relative to the total
-       field: near a magnetic pole the horizontal component vanishes). */
-    float hx, hy;
-    ahrs_mag_detilt(mag_b, roll, pitch, &hx, &hy);
-    if (hx * hx + hy * hy < 1e-4f * mag_norm2)
+    if (h_n[0] * h_n[0] + h_n[1] * h_n[1] < 1e-4f * mag_norm2)
     {
+        a->n_mag_skipped_weak_h++;
         LOG_INFO("ahrs: magnetometer fusion skipped, horizontal field too weak");
         return;
     }
 
-    /* Magnetic heading, corrected to true north by the WMM declination
-       (zero until ahrs_set_position() is called). */
-    const float yaw_mag = ins_wrap_pi_bounded(atan2f(-hy, hx) + a->declination_rad);
+    /* Field azimuth vs. where it should point: magnetic north, turned into a
+       true-north reference by the WMM declination (zero until
+       ahrs_set_position() is called). */
+    const float azimuth = atan2f(h_n[1], h_n[0]);
 
-    float z = ins_wrap_pi_bounded(yaw_mag - yaw_nom);
+    float z = ins_wrap_pi_bounded(a->declination_rad - azimuth);
     float R = qsquare(a->cfg.mag_yaw_stddev_rad);
 
     /* Field-strength disturbance gate (opt-in): downweight (inflate R) once the
@@ -654,7 +661,9 @@ static void ahrs_fuse_mag(ahrs_t* a, const float mag_b[3])
     memset(Ht, 0, sizeof(Ht[0]) * (size_t)n);
     Ht[2] = -1.0f;
 
-    if (ahrs_fuse(a, &z, &R, Ht, 1, a->cfg.mag_chi2_threshold) == 0 && !a->declination_applied)
+    const bool fused = ahrs_fuse(a, &z, &R, Ht, 1, a->cfg.mag_chi2_threshold) == 0;
+    if (fused) { a->n_mag_fused++; }
+    if (fused && !a->declination_applied)
     {
         /* Referenced to magnetic north until a declination is applied, see
            ahrs_set_position (REQ-AHRS-014). */
@@ -1389,6 +1398,61 @@ float ahrs_mag_heading(const float mag_b[3], float roll_rad, float pitch_rad)
     ahrs_mag_detilt(mag_b, roll_rad, pitch_rad, &hx, &hy);
     return atan2f(-hy, hx);
 }
+
+/* TRIAD (Black 1964): the attitude straight from two vector observations,
+ * without Euler angles. The down direction is the primary (exact) vector, the
+ * field only fixes the rotation about it:
+ *     d = down_b / |down_b|,  e = (d x mag_b) / |d x mag_b|,  n = e x d
+ * are north, east and down expressed in the body frame, i.e. the rows of
+ * R_b_to_n. Magnetic north, like ahrs_mag_heading(). */
+/* @satisfies REQ-AHRS-012 */
+bool ahrs_triad_attitude(const float down_b[3], const float mag_b[3], float q[4])
+{
+    const float dn = SQRTF(qsquare(down_b[0]) + qsquare(down_b[1]) + qsquare(down_b[2]));
+    const float mn = SQRTF(qsquare(mag_b[0]) + qsquare(mag_b[1]) + qsquare(mag_b[2]));
+    if (!(dn > 0.0f) || !(mn > 0.0f) || !isfinite(dn) || !isfinite(mn)) { return false; }
+    const float d[3] = {down_b[0] / dn, down_b[1] / dn, down_b[2] / dn};
+    float       e[3];
+    ins_cross(d, mag_b, e);
+    const float en = SQRTF(qsquare(e[0]) + qsquare(e[1]) + qsquare(e[2]));
+    /* Horizontal field below 1 % of the total: at a magnetic pole the heading
+       is undefined (same limit as ahrs_fuse_mag). */
+    if (!(en > 1e-2f * mn)) { return false; }
+    e[0] /= en;
+    e[1] /= en;
+    e[2] /= en;
+    float nv[3];
+    ins_cross(e, d, nv);
+
+    float R[9];
+    int   j;
+    for (j = 0; j < 3; ++j)
+    {
+        MAT_ELEM(R, 0, j, 3, 3) = nv[j];
+        MAT_ELEM(R, 1, j, 3, 3) = e[j];
+        MAT_ELEM(R, 2, j, 3, 3) = d[j];
+    }
+    ins_matrix_to_quat(R, q);
+    ins_quat_normalize(q);
+    return true;
+}
+#endif /* AHRS_NO_MAG */
+
+void ahrs_set_initial_attitude(ahrs_t* a, const float q[4])
+{
+    if (a == NULL || !a->is_initialized || q == NULL) { return; }
+    float qn[4] = {q[0], q[1], q[2], q[3]};
+    ins_quat_normalize(qn);
+    if (!isfinite(qn[0]) || !isfinite(qn[1]) || !isfinite(qn[2]) || !isfinite(qn[3])) { return; }
+    memcpy(a->q, qn, sizeof(qn));
+    /* Same accelerometer low-pass seed as ahrs_init: f_b = -R' * g_n. */
+    float R[9];
+    int   i;
+    ins_quat_to_rotmat(a->q, R);
+    for (i = 0; i < 3; ++i) { a->acc_lowpass_mps2[i] = -AHRS_GRAVITY * MAT_ELEM(R, 2, i, 3, 3); }
+}
+
+#ifndef AHRS_NO_MAG
 
 /* Widen the yaw variance to "heading unknown", never narrowing it
  * (REQ-AHRS-014). Capped just below the yaw restart threshold while the

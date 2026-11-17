@@ -197,7 +197,8 @@ typedef struct
  *
  *  E.g. from a lighthouse/mocap pose, a dual-antenna GNSS heading or a gyro
  *  compass. ZYX (Tait-Bryan) yaw of the body relative to NED, same convention
- *  as ins_get_rpy().
+ *  as ins_get_rpy() - more generally, the azimuth of the body axis set in
+ *  ins_options_t.heading_axis_b (default x, for which the two are the same).
  *
  *  Any single-turn convention is accepted and normalized internally. A heading
  *  beyond one full turn is treated as a unit or unwrapping error: dropped and
@@ -968,6 +969,17 @@ typedef struct
      * epoch, the filter stops and re-arms with its biases carried. nav_suite
      * hands the same value to the ARS/AHRS and baro_alt. */
     float imu_loss_timeout_sec; /**< [s] (0 -> default) */
+
+    /* Heading axis: the body axis whose azimuth (direction in the horizontal
+     * plane, from north towards east) an absolute heading measurement
+     * reports, for ins_meas_yaw_t and the automotive course yaw. All zero ->
+     * the body x axis, for which the azimuth is exactly the ZYX yaw. A heading
+     * measurement is skipped only while THIS axis is within asin(0.99) (~82
+     * deg) of the vertical, where its azimuth is undefined - not whenever the
+     * pitch is near +-90 deg. E.g. a rocket that reports the heading of an
+     * axis across its body keeps fusing it while it points straight up. Need
+     * not be normalised. */
+    float heading_axis_b[3]; /**< body frame (0,0,0 -> (1,0,0)) */
 } ins_options_t;
 
 /** @brief Nominal state vector (float-only, local n-frame). */

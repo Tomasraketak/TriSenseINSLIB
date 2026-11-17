@@ -69,6 +69,14 @@ getLastUpdateUs	KEYWORD2
 getMaxUpdateUs	KEYWORD2
 getDroppedEpochs	KEYWORD2
 getImuLostPackets	KEYWORD2
+getImuLostSamples	KEYWORD2
+getLastEpochSamples	KEYWORD2
+getImuMaxBacklog	KEYWORD2
+getImuBacklog	KEYWORD2
+getDtMismatchCount	KEYWORD2
+getLastEpochDt	KEYWORD2
+getImuSamplePeriodUs	KEYWORD2
+getImuMaxPacketsPerUpdate	KEYWORD2
 getFreeStack	KEYWORD2
 stackOk	KEYWORD2
 diagnostics	KEYWORD2

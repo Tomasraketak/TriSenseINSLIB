@@ -376,6 +376,11 @@ typedef struct
                                   diagnostic only, 0 whenever chi2_disable is
                                   set */
 
+    /* Magnetometer heading fusions (AHRS mode), diagnostic only. */
+    uint32_t n_mag_fused;          /**< samples fused into the heading */
+    uint32_t n_mag_skipped_weak_h; /**< samples skipped because the
+                                        horizontal field was too weak (pole) */
+
     /* Overconfidence / covariance-collapse watchdog (REQ-AHRS-020): the
        attitude analogue of INS's REQ-NAV-040. Flags when the reported attitude
        1-sigma becomes physically implausible. Purely diagnostic. Covers
@@ -641,7 +646,34 @@ extern "C"
      *  @param[in] pitch_rad Current pitch [rad].
      *  @return Heading [rad] in (-pi, pi]. */
     float ahrs_mag_heading(const float mag_b[3], float roll_rad, float pitch_rad);
+
+    /** @brief Attitude from gravity and the magnetic field (TRIAD).
+     *
+     *  Builds the body-to-n rotation directly from the two vectors, with no
+     *  Euler angles, so it is equally valid at pitch +/-90 deg. The down
+     *  direction is taken as exact, the field only fixes the rotation about
+     *  it. North is MAGNETIC north (declination not applied), as for
+     *  ahrs_mag_heading().
+     *
+     *  @param[in] down_b Direction of gravity (down) in the body frame, any
+     *             length; at rest that is -acc.
+     *  @param[in] mag_b Magnetometer, body frame (any unit).
+     *  @param[out] q Body-to-NED quaternion (Hamilton, scalar first).
+     *  @return false (q untouched) if either vector is zero or the field is
+     *          (nearly) parallel to gravity, i.e. at a magnetic pole. */
+    bool ahrs_triad_attitude(const float down_b[3], const float mag_b[3], float q[4]);
 #endif /* AHRS_NO_MAG */
+
+    /** @brief Replace the attitude of a freshly initialised filter.
+     *
+     *  For a start attitude that is known as a quaternion rather than as
+     *  roll/pitch/yaw (e.g. from ahrs_triad_attitude()). Call right after
+     *  ahrs_init(), before ahrs_set_position(); the covariance from
+     *  cfg.rpy_init_stddev_rad (n-frame) is kept.
+     *
+     *  @param[in,out] a Initialised filter.
+     *  @param[in] q Body-to-NED quaternion (normalised here). */
+    void ahrs_set_initial_attitude(ahrs_t* a, const float q[4]);
 
 #ifdef __cplusplus
 }

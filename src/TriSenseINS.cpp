@@ -311,6 +311,8 @@ bool TriSenseINS::initFilter() {
   opt.mag_field_tolerance   = _cfg.magFieldTolerance;
   opt.auto_zupt_disable     = !_cfg.autoZupt;
   opt.chi2_disable          = !_cfg.outlierRejection;
+  // Body axis absolute headings refer to (FRD; INSLIB patch 0001).
+  for (int i = 0; i < 3; i++) opt.heading_axis_b[i] = _cfg.headingAxis[i];
   // The magnetometer is calibrated here (setMagCalibration), so INSLIB's own
   // mag_fixed_bias / mag_misalignment stay at zero = identity.
 
@@ -786,7 +788,7 @@ bool TriSenseINS::feedGnss(const TriSenseGnssFix &fix) {
     float c = wrap360(fix.courseDeg);
     if (c > 180.0f) c -= 360.0f;
     _pending.yaw.is_valid = true;
-    _pending.yaw.yaw_rad = c * DEG2RADF;  // NED yaw == course over ground
+    _pending.yaw.yaw_rad = c * DEG2RADF;  // heading of headingAxis == course over ground
     _pending.yaw.stddev_rad = _cfg.gnssCourseSigmaDeg * DEG2RADF;
     _pending.yaw_delay_ms = delayMs;
     _yawFedUs = _gnssFedUs;

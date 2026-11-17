@@ -1747,6 +1747,33 @@ static void ins_fuse_mag(ins_t* f, const ins_measurements_t* m)
     }
 }
 
+/* Azimuth [rad] of the heading axis (ins_options_t.heading_axis_b, default
+ * body x) for the attitude R_b_to_n. False while that axis is within
+ * asin(0.99) of the vertical, where its azimuth is undefined. For body x this
+ * is exactly the ZYX yaw and the former "pitch close to +/-90 deg" gate.
+ * A rotation psi_z about the vertical (the n-frame attitude error) changes the
+ * azimuth of any non-vertical axis by exactly psi_z, so the yaw residual keeps
+ * H = e_z on the attitude block (ins_fuse_yaw_residual). */
+static bool ins_heading_axis_azimuth(const ins_t* f, const float R_b_to_n[9], float* az)
+{
+    float       axis[3] = {f->opt.heading_axis_b[0], f->opt.heading_axis_b[1],
+                           f->opt.heading_axis_b[2]};
+    const float n2      = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
+    if (!(n2 > 1e-12f) || !isfinite(n2))
+    {
+        axis[0] = 1.0f;
+        axis[1] = 0.0f;
+        axis[2] = 0.0f;
+    }
+    float v[3];
+    mat3_mul_vec3(R_b_to_n, axis, v);
+    const float len2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    const float h2   = v[0] * v[0] + v[1] * v[1];
+    if (h2 < (1.0f - 0.99f * 0.99f) * len2) { return false; }
+    *az = atan2f(v[1], v[0]);
+    return true;
+}
+
 /* Absolute yaw aiding (e.g. lighthouse/mocap pose orientation, dual-antenna
  * GNSS heading, gyro compass). Fused as a scalar yaw-error measurement,
  * optionally anchored in the history for delayed measurements. */
@@ -1768,16 +1795,13 @@ static void ins_fuse_yaw(ins_t* f, const ins_measurements_t* m)
     }
     const float* R_tov = tov.R_b_to_n;
 
-    /* Yaw is ill-defined near pitch = +/-90 deg -> skip. */
-    const float sp = -MAT_ELEM(R_tov, 2, 0, 3, 3);
-    if (sp > 0.99f || sp < -0.99f)
+    /* The heading of an axis close to the vertical is ill-defined -> skip. */
+    float yaw_nom;
+    if (!ins_heading_axis_azimuth(f, R_tov, &yaw_nom))
     {
-        LOG_INFO("ins: pitch close to +/- 90 deg -> skip yaw measurement ");
+        LOG_INFO("ins: heading axis close to vertical -> skip yaw measurement ");
         return;
     }
-
-    float roll, pitch, yaw_nom;
-    ins_rotmat_to_rpy(R_tov, &roll, &pitch, &yaw_nom);
 
     const float dyaw = ins_angle_diff(yaw_nom, m->yaw.yaw_rad);
     if (ins_fuse_yaw_residual(f, dyaw, qsquare(m->yaw.stddev_rad), f->chi2_thr_yaw) == 0)
@@ -3337,12 +3361,9 @@ static void ins_fuse_gnss_course_yaw(ins_t* f, const ins_measurements_t* m)
     }
     const float* R_tov = tov.R_b_to_n;
 
-    /* Yaw is ill-defined near pitch = +/-90 deg (gimbal lock) -> skip. */
-    const float sp = -MAT_ELEM(R_tov, 2, 0, 3, 3);
-    if (sp > 0.99f || sp < -0.99f) { return; }
-
-    float roll, pitch, yaw_nom;
-    ins_rotmat_to_rpy(R_tov, &roll, &pitch, &yaw_nom);
+    /* The heading of an axis close to the vertical is ill-defined -> skip. */
+    float yaw_nom;
+    if (!ins_heading_axis_azimuth(f, R_tov, &yaw_nom)) { return; }
 
     const float course = atan2f(vE, vN);
     const float dyaw   = ins_wrap_pi_bounded(yaw_nom - course);
@@ -4763,9 +4784,19 @@ static float ins_autoinit_yaw(const ins_t* f, const ins_measurements_t* m, float
     /* 1) External heading (dual-antenna GNSS, lighthouse pose, ...). */
     if (m->yaw.is_valid && m->yaw.stddev_rad > 0.0f)
     {
-        LOG_INFO("ins: using supplied initial yaw: %.0f deg", (double)RAD2DEG(m->yaw.yaw_rad));
-        *yaw_var = qsquare(m->yaw.stddev_rad);
-        return m->yaw.yaw_rad;
+        /* The measurement is the azimuth of the heading axis: the ZYX yaw is
+           that minus the axis' azimuth at zero yaw (the identity for body x).
+           Unusable while the axis is vertical. */
+        float q0[4], R0[9], az0;
+        ins_quat_from_rpy(roll, pitch, 0.0f, q0);
+        ins_quat_to_rotmat(q0, R0);
+        if (ins_heading_axis_azimuth(f, R0, &az0))
+        {
+            const float yaw = ins_wrap_pi_bounded(m->yaw.yaw_rad - az0);
+            LOG_INFO("ins: using supplied initial yaw: %.0f deg", (double)RAD2DEG(yaw));
+            *yaw_var = qsquare(m->yaw.stddev_rad);
+            return yaw;
+        }
     }
 
     /* 2) External attitude hint's own yaw (REQ-NAV-048), e.g. nav_suite's

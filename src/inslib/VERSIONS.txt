@@ -1,20 +1,24 @@
 Vendored by tools/update_inslib.sh - do not edit files in this folder.
-*.c.inc files are the upstream *.c files, renamed only.
+*.c.inc files are the upstream *.c files, renamed only, with the patches
+listed below applied (change those in tools/inslib_patches, not here).
 
 INSLIB v1.4.2 9b69e5fea77f11fbfe6c9b55292442f621d50e1b
 KFCore 8648bad199493676f5cd3e51478998b4db66586c
 
-sha256 (of the upstream file contents):
+patches (tools/inslib_patches, sha256):
+  4baa0392f286c9b8920bcfb84d726c2610776b7d7bcb174d2d8fd3e80f6e52fe  0001-Attitude-without-Euler-singularities-mag-azimuth-TRI.patch
+
+sha256 (of the vendored file contents):
 8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef  LICENSE.INSLIB
 196b2898595f5ebc19adf4576aa84cd2e5f5a74ae942a4842e6732b8c0f41081  LICENSE.KFCore
-3084a102cd8a68d87298d4f774e81572cd4a3c7bfc7af706b88cab52717306f1  ahrs.c.inc
-3043c59c43f7b1b3af5a32c7b7028069df2d3049a0aab705b97d7014532b2fa7  ahrs.h
+489a448185a6ac8547cc48d14f41686189205e53607e24f294db7de363d53a36  ahrs.c.inc
+ce94cd050b4b9c099d5be3bbf75682cc1345e72d88b6bb117e4029e62617f311  ahrs.h
 adc287ea8cf08c1b9d7a2ba67cef309d6dc27144e8b0e4897090725340bcf1dc  baro_alt.c.inc
 06d7ce64281ba2096fe3932fe9770b3d042704a82750abdcb08c8d23c1094cd0  baro_alt.h
 8daf504f015ca7bf842985962d8436d2e9aa52f0f725ba7f3034e494f64070cf  geodetic_toolbox.c.inc
 f6603b87e07caadf4c08d450caf3dab5e58551cb5917487f895313785bb3a388  geodetic_toolbox.h
-841a08b7dc8d2959991df1d566692ce34087c3b4c05c396cf690ed3a38b4dc70  ins.c.inc
-979e751cf78baa649f9fc7ddc74bc2179b745ec99e44299f3f1c86251ca44dd2  ins.h
+ca9e95bd32eb989a6051f93f8742f10524d9c0afc5817d38324357c74bc37e31  ins.c.inc
+c91314448b853903ca2e2eab888c952d6c17bc8591f93cde051675083ac28523  ins.h
 50ac70273bf0316cacb415b5befa8ea256f2d0cfd4cc2451d2651f80565e85a2  kalman_takasu.c.inc
 5291e720f0f48598b9027ad2ec86c67ce3d0e3e7431252f8d32261154737c50c  kalman_takasu.h
 f4df14203d7e61eab27c173aff534711d21bcd3bdc8f8ac1b104dcb80020cbbf  kalman_udu.c.inc
@@ -27,7 +31,7 @@ ca852d4d50f0998e3a7dc4141da576151c64b6112e32ece4958a992e0605db2a  log.h
 8c1c74a7f3df465e8dd38bb8d01412f1eb823481dd51f872c8cfdd0dd71ed05a  magnetic_model.h
 bac9fc352885ddadf151d4473ceb88866ee6f715f3cb1a2699183152a318345b  miniblas.c.inc
 6c47b0e622a965e420350c3fdcbdebb1cb2e0548cd0754a825d4f5ec420d780a  miniblas.h
-b677c779abbf086f705d90f1d11dd56cd436e614c7c8d1c3ca95fc69bef09f90  nav_suite.c.inc
+c854e7e66cc3a1692bda44f3e470d837c0eed6d9345bc9601216f6ac82aa11e7  nav_suite.c.inc
 98f9d74327c70bd52921cc46b6baedb6e0c07695b0c71942e026ba1c7096cfdb  nav_suite.h
 2638e994174f346cc7e7b45397b1c691b4c66822de7947822445f5b321c122bc  sensor_defaults.h
 607de0440c389aa5fd937dfddb575c59bf205ce4f810a11dedd8be0affad8770  wmm_lut.h

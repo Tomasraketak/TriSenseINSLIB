@@ -303,6 +303,55 @@ static void rateFlip(double t, double w[3]) {
   for (int i = 0; i < 3; i++) w[i] = 400.0 * M_PI / 180.0 * env * ax[i] / n;
 }
 
+// Static pose for the body-motion truth.
+static void bmPose(float rollDeg, float pitchDeg, float yawDeg) {
+  const double r = rollDeg * M_PI / 360.0, p = pitchDeg * M_PI / 360.0, y = yawDeg * M_PI / 360.0;
+  const double qz[4] = {cos(y), 0, 0, sin(y)}, qy[4] = {cos(p), 0, sin(p), 0}, qx[4] = {cos(r), sin(r), 0, 0};
+  double t[4];
+  dqMul(qz, qy, t);
+  dqMul(t, qx, g_bm.q);
+  bmSetTruth();
+}
+// The magnetometer AHRS references magnetic north until it gets a position:
+// rotate the truth by the simulated field's declination before comparing.
+static const double MAG_DEC = atan2(1.7, 19.9);
+static void truthMagnetic(float T[3][3]) {
+  const double h[4] = {cos(-MAG_DEC / 2), 0, 0, sin(-MAG_DEC / 2)};
+  double q[4];
+  dqMul(h, g_bm.q, q);
+  dqToMat(q, T);
+}
+// Error about the vertical (heading) against the magnetic truth [deg].
+static float errMagneticVertical(const TriSenseINS &ins) {
+  float R[3][3], T[3][3];
+  if (!ins.getRotationMatrix(R)) return 999.0f;
+  truthMagnetic(T);
+  float E[3][3];
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) E[i][j] = R[i][0] * T[j][0] + R[i][1] * T[j][1] + R[i][2] * T[j][2];
+  return 0.5f * (E[1][0] - E[0][1]) / D2R;
+}
+static float errMagnetic(const TriSenseINS &ins) {
+  float R[3][3], T[3][3];
+  if (!ins.getRotationMatrix(R)) return 999.0f;
+  truthMagnetic(T);
+  return rotErrDeg(R, T);
+}
+// Angle between the estimated and the true down direction in the body [deg].
+static float tiltErr(const TriSenseINS &ins) {
+  float R[3][3], T[3][3];
+  if (!ins.getRotationMatrix(R)) return 999.0f;
+  dqToMat(g_bm.q, T);
+  double c = 0;
+  for (int i = 0; i < 3; i++) c += (double)R[2][i] * T[2][i];
+  return (float)(acos(c > 1 ? 1 : c) * 180.0 / M_PI);
+}
+static double g_pitchRateDps = 0, g_pitchT0 = 1e30, g_pitchT1 = 1e30;
+static void ratePitch(double t, double w[3]) {
+  w[0] = w[2] = 0;
+  w[1] = (t > g_pitchT0 && t < g_pitchT1) ? g_pitchRateDps * M_PI / 180.0 : 0.0;
+}
+
 static float angDiff(float a, float b) {
   float d = fmodf(a - b + 540.0f, 360.0f) - 180.0f;
   return fabsf(d);
@@ -664,6 +713,197 @@ int main() {
       CHECK(sdErr[1] < 0.05f, "%s: per-sample strapdown error %.4f deg after 400 deg", name, sdErr[1]);
       CHECK(vErr[1] < 0.02f, "%s: per-sample velocity error %.4f m/s (sculling)", name, vErr[1]);
       CHECK(fErr[1] < 3.0f && fErr[0] < 3.0f, "%s: full filter within 3 deg (%.2f / %.2f)", name, fErr[0], fErr[1]);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  printf("13) Daidalos on the rail: board -Y to the nose, ComponentsUp -> roll -90, pitch 0\n");
+  {
+    TriSenseINS ins(sensor);
+    bmStart(nullptr);
+    bmPose(-90, 0, 123);
+    CHECK(ins.begin(), "begin()");
+    runLoop(ins, 20, 250);
+    float r, p, y;
+    ins.getRPY(r, p, y);
+    printf("  info: rpy %.3f %.3f %.3f, error vs magnetic truth %.3f deg\n", r, p, y, errMagnetic(ins));
+    CHECK(fabsf(r + 90.0f) < 1.0f && fabsf(p) < 1.0f, "roll %.2f (-90) pitch %.2f (0)", r, p);
+    CHECK(angDiff(y, 123.0f - (float)(MAG_DEC * 180 / M_PI)) < 2.0f, "magnetic heading %.2f (expect %.2f)", y,
+          123.0f - (float)(MAG_DEC * 180 / M_PI));
+    CHECK(errMagnetic(ins) < 1.5f, "attitude error %.2f deg", errMagnetic(ins));
+    bmStop();
+  }
+
+  // -------------------------------------------------------------------------
+  printf("14) Pitching through 90 deg (x vertical) with the magnetometer, no GNSS\n");
+  {
+    TriSenseINS ins(sensor);
+    bmStart(ratePitch);
+    bmPose(0, 0, 30);
+    g_pitchRateDps = 30.0;
+    g_pitchT0 = 1e30;
+    // In flight: no stillness detection, which would otherwise measure the
+    // gyro bias below directly and hide whether the magnetometer is used.
+    TriSenseINSConfig c;
+    c.autoZupt = false;
+    CHECK(ins.begin(c), "begin()");
+    runLoop(ins, 15, 250);
+    float maxErr = 0, maxStep = 0, prevErr = errMagnetic(ins);
+    auto track = [&] {
+      const float e = errMagnetic(ins);
+      maxErr = fmaxf(maxErr, e);
+      maxStep = fmaxf(maxStep, fabsf(e - prevErr));
+      prevErr = e;
+    };
+    // Up to pitch 90 (3 s).
+    g_pitchT0 = g_sim_us * 1e-6;
+    g_pitchT1 = g_pitchT0 + 3.0;
+    for (int k = 0; k < 4 * 3000; k++) {
+      g_sim_us += 250;
+      if (ins.update()) track();
+    }
+    CHECK(maxErr < 1.5f, "on the way up to pitch 90: error never above %.2f deg", maxErr);
+    // Held there for 60 s while the gyro grows a 0.3 deg/s bias about body x -
+    // which is now the vertical, i.e. exactly the heading axis. Without the
+    // magnetometer that is 18 deg of heading drift.
+    const ahrs_t &a = ins.suite().ahrs;
+    const uint32_t fused0 = a.n_mag_fused, weak0 = a.n_mag_skipped_weak_h;
+    g_truth.gyrBiasDps[0] = 0.3f;
+    for (int k = 0; k < 4 * 60000; k++) {
+      g_sim_us += 250;
+      if (ins.update()) track();
+    }
+    const uint32_t fused = a.n_mag_fused - fused0;
+    float gb[3];
+    ahrs_get_bias_gyr(&a, gb);
+    float T[3][3];
+    dqToMat(g_bm.q, T);
+    const float errHold = errMagnetic(ins);
+    printf("  info: body x %.2f deg from vertical; %u magnetometer samples fused in 60 s (%u skipped, weak field);\n"
+           "        heading error %.2f deg, tilt %.2f deg; AHRS gyro bias x %.3f deg/s (true 0.3)\n",
+           acosf(fabsf(T[2][0])) * 180.0f / (float)M_PI, (unsigned)fused, (unsigned)(a.n_mag_skipped_weak_h - weak0),
+           errMagneticVertical(ins), tiltErr(ins), gb[0] / D2R);
+    CHECK(fused >= 0.95f * 5 * 60, "magnetometer fused at pitch 90: %u of ~300 samples (5 Hz)", (unsigned)fused);
+    // How fast the bias is learnt is AHRS tuning (heading measurement 1-sigma
+    // 10 deg at 5 Hz by default); what matters here is that it is learnt at
+    // all - before, the heading was simply not observed at pitch 90 (error
+    // 9.1 deg after 30 s, bias estimate 0.000 in the same scenario).
+    CHECK(gb[0] / D2R > 0.1f, "the heading-axis gyro bias is being learnt (%.3f deg/s, true 0.3)", gb[0] / D2R);
+    CHECK(errHold < 9.0f, "attitude error %.2f deg after 60 s at pitch 90 with a 0.3 deg/s bias (unaided: 18 deg)",
+          errHold);
+    // And on over the top to pitch 150 (upside down, heading flipped).
+    g_truth.gyrBiasDps[0] = 0.0f;
+    g_pitchT0 = g_sim_us * 1e-6;
+    g_pitchT1 = g_pitchT0 + 2.0;
+    for (int k = 0; k < 4 * 6000; k++) {
+      g_sim_us += 250;
+      if (ins.update()) track();
+    }
+    CHECK(maxStep < 0.2f, "attitude continuous through pitch 90: largest epoch-to-epoch error change %.3f deg", maxStep);
+    CHECK(errMagnetic(ins) < 6.0f, "attitude error %.2f deg at pitch 150 (upside down)", errMagnetic(ins));
+    g_pitchT0 = g_pitchT1 = 1e30;
+    bmStop();
+  }
+
+  // -------------------------------------------------------------------------
+  printf("15) Initial alignment in 50 random poses, incl. pitch +-90\n");
+  {
+    std::mt19937 prng(7);
+    std::uniform_real_distribution<float> U(-180.0f, 180.0f), UP(-90.0f, 90.0f);
+    float worstAlign = 0, worstSettled = 0, worstTilt = 0;
+    int bad = 0;
+    for (int i = 0; i < 50; i++) {
+      float r = U(prng), p = UP(prng), y = U(prng);
+      if (i < 8) {
+        const float forced[8] = {90, -90, 89.9f, -89.9f, 90, -90, 89.5f, -89.5f};
+        p = forced[i];
+      }
+      for (int withMag = 1; withMag >= 0; withMag--) {
+        TriSenseINS ins(sensor);
+        TriSenseINSConfig c;
+        c.useMagnetometer = withMag;
+        bmStart(nullptr);
+        bmPose(r, p, y);
+        ins.begin(c);
+        // Run until the attitude filter has bootstrapped, then once more.
+        const ahrs_t &a = withMag ? ins.suite().ahrs : ins.suite().ars;
+        for (int k = 0; k < 4 * 10000 && !a.is_initialized; k++) { g_sim_us += 250; ins.update(); }
+        float align;
+        if (withMag) {
+          align = errMagnetic(ins);
+          runLoop(ins, 5, 250);
+          const float settled = errMagnetic(ins);
+          worstAlign = fmaxf(worstAlign, align);
+          worstSettled = fmaxf(worstSettled, settled);
+          if (settled >= 1.0f) {
+            bad++;
+            printf("  info: pose %d (r %.1f p %.1f y %.1f): error %.2f at alignment, %.2f after 5 s\n", i, r, p, y,
+                   align, settled);
+          }
+        } else {
+          align = tiltErr(ins);
+          worstTilt = fmaxf(worstTilt, align);
+          if (align >= 1.0f) {
+            bad++;
+            printf("  info: pose %d (r %.1f p %.1f y %.1f), no magnetometer: tilt error %.2f\n", i, r, p, y, align);
+          }
+        }
+        bmStop();
+      }
+    }
+    // Right after alignment the heading carries the noise of the single
+    // magnetometer sample it was taken from (0.3 uT on a 20 uT horizontal
+    // field, ~1 deg 1-sigma); the filter averages that out within seconds.
+    CHECK(worstAlign < 4.0f, "with magnetometer: worst error right after alignment %.3f deg", worstAlign);
+    CHECK(worstSettled < 1.0f, "with magnetometer: worst error 5 s later %.3f deg", worstSettled);
+    CHECK(worstTilt < 1.0f, "without magnetometer: worst tilt error after alignment %.3f deg", worstTilt);
+    CHECK(bad == 0, "all 100 alignments converge within 1 deg (%d outside)", bad);
+  }
+
+  // -------------------------------------------------------------------------
+  printf("16) Heading axis: INS with GNSS standing on its x axis (pitch 90), heading fed for FRD z\n");
+  {
+    // Body x straight up, yaw 40: FRD z then points horizontally to azimuth 40.
+    // pass 3: the default axis at an ordinary pitch, where the fed heading is
+    // the plain yaw as before.
+    for (int pass = 0; pass < 4; pass++) {
+      TriSenseINS ins(sensor);
+      TriSenseINSConfig c;
+      c.useMagnetometer = false;  // the fed heading is the only heading source
+      if (pass == 1 || pass == 2) { c.headingAxis[0] = 0; c.headingAxis[2] = 1; }
+      const float pitch = pass == 2 ? 60.0f : pass == 3 ? 10.0f : 90.0f;
+      bmStart(nullptr);
+      bmPose(0, pitch, 40);
+      ins.begin(c);
+      // Azimuth of FRD z for this pose (= 40 at pitch 90; 220 at pitch 60,
+      // where z leans back over the nose).
+      float T[3][3];
+      dqToMat(g_bm.q, T);
+      const int ax = (pass == 1 || pass == 2) ? 2 : 0;
+      const float azZ = atan2f(T[1][ax], T[0][ax]) / D2R;
+      const double lat0 = 50.0812345, lon0 = 14.4201234;
+      for (int s5 = 0; s5 < 60 * 5; s5++) {
+        for (int k = 0; k < 800; k++) { g_sim_us += 250; ins.update(); }
+        ins.feedGnss(lat0 + sim_noise(1.0f) / 111e3, lon0 + sim_noise(1.0f) / 71e3, 250.0f + sim_noise(2.0f), 1.0f,
+                     10, 0.0f, NAN, 20);
+        ins.feedHeading(azZ + sim_noise(1.0f), 1.0f);
+      }
+      float sr, sp, sy;
+      ins.getRPYStdDev(sr, sp, sy);
+      float R[3][3];
+      float err = 999.0f;
+      if (ins.isReady() && ins.getRotationMatrix(R)) err = rotErrDeg(R, T);
+      printf("  info: axis %s, pitch %.0f: INS ready %d, attitude error %.2f deg, yaw 1-sigma %.1f deg\n",
+             ax ? "FRD z" : "FRD x (default)", pitch, ins.isReady(), err, sy);
+      if (pass == 3) {
+        CHECK(err < 2.0f, "default axis at pitch 10: heading = yaw fused as before, error %.2f deg", err);
+      } else if (pass == 0) {
+        CHECK(!(err < 5.0f && sy < 5.0f), "default axis FRD x is vertical: its heading is ignored (yaw 1-sigma %.1f)",
+              sy);
+      } else {
+        CHECK(err < 2.0f, "heading of FRD z fused at pitch %.0f: attitude error %.2f deg", pitch, err);
+      }
+      bmStop();
     }
   }
 

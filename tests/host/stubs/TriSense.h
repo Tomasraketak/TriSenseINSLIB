@@ -20,6 +20,7 @@ struct SimTruth {
   void (*truthFn)(double tSec) = nullptr;
   float gyrNoiseDps = 0.05f;   // per-sample 1-sigma
   float accNoiseG = 0.002f;
+  float gyrBiasDps[3] = {0, 0, 0};  // sensor axes
 };
 extern SimTruth g_truth;
 float sim_noise(float sigma);
@@ -56,7 +57,7 @@ struct SimIMU {
     if (g_truth.truthFn) g_truth.truthFn(t);
     for (int i = 0; i < 3; i++) {
       p.a[i] = g_truth.acc[i] + sim_noise(g_truth.accNoiseG * g_truth.vib);
-      p.g[i] = g_truth.gyr[i] + sim_noise(g_truth.gyrNoiseDps * g_truth.vib);
+      p.g[i] = g_truth.gyr[i] + g_truth.gyrBiasDps[i] + sim_noise(g_truth.gyrNoiseDps * g_truth.vib);
     }
   }
   void produce() {
