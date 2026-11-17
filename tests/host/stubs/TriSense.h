@@ -35,7 +35,8 @@ struct SimIMU {
   double odrHz = 1000.0;     // true sample rate (tests can detune it)
   int    reportedOdrHz = 1000;
   uint64_t nextNs = 0;       // time of the next sample to be produced
-  struct Pkt { float a[3], g[3]; } q[CAP];
+  struct Pkt { float a[3], g[3]; double t; } q[CAP];
+  double lastReadT = 0;  // sample time of the last packet handed out [s]
   int head = 0, count = 0;
   uint32_t chipLost = 0;      // the chip's own counter (since flush)
   uint32_t driverLost = 0;    // what getLostPacketCount() reports
@@ -51,6 +52,7 @@ struct SimIMU {
   uint32_t getLostPacketCount() { return driverLost; }
 
   void sample(Pkt &p, double t) {
+    p.t = t;
     if (g_truth.truthFn) g_truth.truthFn(t);
     for (int i = 0; i < 3; i++) {
       p.a[i] = g_truth.acc[i] + sim_noise(g_truth.accNoiseG * g_truth.vib);
@@ -95,6 +97,7 @@ struct SimIMU {
     refillCheck();
     if (count == 0) return false;
     const Pkt &p = q[head];
+    lastReadT = p.t;
     head = (head + 1) % CAP;
     count--;
     ax = p.a[0]; ay = p.a[1]; az = p.a[2]; gx = p.g[0]; gy = p.g[1]; gz = p.g[2];

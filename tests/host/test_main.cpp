@@ -76,13 +76,16 @@ static void runLoop(TriSenseINS &ins, float seconds, uint32_t loopUs) {
 
 // Angle of the rotation between an estimated and a true body->NED matrix [deg].
 static float rotErrDeg(const float A[3][3], const float B[3][3]) {
-  float tr = 0;
+  // E = A B^T; angle = atan2(|vee(E - E^T)| / 2, (tr E - 1) / 2), exact at
+  // small angles where acos of the trace loses everything below ~0.03 deg.
+  double E[3][3];
   for (int i = 0; i < 3; i++)
-    for (int k = 0; k < 3; k++) tr += A[k][i] * B[k][i];
-  float c = 0.5f * (tr - 1.0f);
-  if (c > 1.0f) c = 1.0f;
-  if (c < -1.0f) c = -1.0f;
-  return acosf(c) / D2R;
+    for (int j = 0; j < 3; j++)
+      E[i][j] = (double)A[i][0] * B[j][0] + (double)A[i][1] * B[j][1] + (double)A[i][2] * B[j][2];
+  const double vx = E[2][1] - E[1][2], vy = E[0][2] - E[2][0], vz = E[1][0] - E[0][1];
+  const double sn = 0.5 * sqrt(vx * vx + vy * vy + vz * vz);
+  const double cs = 0.5 * (E[0][0] + E[1][1] + E[2][2] - 1.0);
+  return (float)(atan2(sn, cs) * 180.0 / M_PI);
 }
 
 static float insErrDeg(const TriSenseINS &ins, float rollDeg, float pitchDeg, float yawDeg) {
@@ -112,6 +115,192 @@ static TriSenseINSConfig timingConfig() {
   c.useMagnetometer = false;  // attitude from the ARS: yaw is pure gyro integration
   c.autoZupt = false;
   return c;
+}
+
+// ---------------------------------------------------------------------------
+// Scripted body motion: a body rate w_b(t) [rad/s, FRD] integrated in double
+// precision in 5 us steps. Each IMU sample gets the MEAN rate over its own
+// sample interval (what a rate gyro behind its anti-alias filter reports), the
+// accelerometer gets gravity in the current body frame (no translation).
+// ---------------------------------------------------------------------------
+struct BodyMotion {
+  double t = 0;
+  double q[4] = {1, 0, 0, 0};  // FRD -> NED
+  void (*rate)(double t, double w[3]) = nullptr;
+  double gyrAvg[3] = {0, 0, 0};
+  double accAvg[3] = {0, 0, -9.80665};  // body specific force, interval mean [m/s^2]
+};
+static BodyMotion g_bm;
+
+static void dqMul(const double a[4], const double b[4], double o[4]) {
+  o[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
+  o[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
+  o[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
+  o[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
+}
+static void dqToMat(const double q[4], float R[3][3]) {
+  const double w = q[0], x = q[1], y = q[2], z = q[3];
+  R[0][0] = 1 - 2 * (y * y + z * z); R[0][1] = 2 * (x * y - w * z);     R[0][2] = 2 * (x * z + w * y);
+  R[1][0] = 2 * (x * y + w * z);     R[1][1] = 1 - 2 * (x * x + z * z); R[1][2] = 2 * (y * z - w * x);
+  R[2][0] = 2 * (x * z - w * y);     R[2][1] = 2 * (y * z + w * x);     R[2][2] = 1 - 2 * (x * x + y * y);
+}
+static void bmSetTruth() {
+  float R[3][3];
+  dqToMat(g_bm.q, R);
+  float f_b[3], m_b[3];
+  for (int i = 0; i < 3; i++) {
+    f_b[i] = (float)g_bm.accAvg[i];
+    m_b[i] = R[0][i] * MAG_N[0] + R[1][i] * MAG_N[1] + R[2][i] * MAG_N[2];
+  }
+  // FRD -> TriSense axes (components up): x = F, y = -R, z = -D.
+  g_truth.acc[0] = f_b[0] / G; g_truth.acc[1] = -f_b[1] / G; g_truth.acc[2] = -f_b[2] / G;
+  g_truth.gyr[0] = (float)(g_bm.gyrAvg[0] / D2R);
+  g_truth.gyr[1] = (float)(-g_bm.gyrAvg[1] / D2R);
+  g_truth.gyr[2] = (float)(-g_bm.gyrAvg[2] / D2R);
+  g_truth.mag[0] = m_b[0]; g_truth.mag[1] = -m_b[1]; g_truth.mag[2] = -m_b[2];
+  g_truth.pressure = isaPressure(0);
+}
+static void truthBodyMotion(double t) {
+  if (t > g_bm.t) {
+    const double span = t - g_bm.t;
+    const int n = (int)ceil(span / 5e-6);
+    const double h = span / n;
+    double sum[3] = {0, 0, 0}, fsum[3] = {0, 0, 0};
+    for (int k = 0; k < n; k++) {
+      double w[3] = {0, 0, 0};
+      if (g_bm.rate) g_bm.rate(g_bm.t + (k + 0.5) * h, w);
+      for (int i = 0; i < 3; i++) sum[i] += w[i];
+      // Specific force R^T (0, 0, -g), sampled with the attitude at the
+      // start of the step (the half-step offset averages out over n steps).
+      const double *q = g_bm.q;
+      fsum[0] += -G * 2 * (q[1] * q[3] - q[0] * q[2]);
+      fsum[1] += -G * 2 * (q[2] * q[3] + q[0] * q[1]);
+      fsum[2] += -G * (1 - 2 * (q[1] * q[1] + q[2] * q[2]));
+      const double a = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) * h;
+      const double s = a > 1e-12 ? sin(0.5 * a) / (a / h) : 0.5 * h;
+      const double e[4] = {cos(0.5 * a), w[0] * s, w[1] * s, w[2] * s};
+      double qn[4];
+      dqMul(g_bm.q, e, qn);
+      const double nr = 1.0 / sqrt(qn[0] * qn[0] + qn[1] * qn[1] + qn[2] * qn[2] + qn[3] * qn[3]);
+      for (int i = 0; i < 4; i++) g_bm.q[i] = qn[i] * nr;
+    }
+    for (int i = 0; i < 3; i++) {
+      g_bm.gyrAvg[i] = sum[i] / n;
+      g_bm.accAvg[i] = fsum[i] / n;
+    }
+    g_bm.t = t;
+  }
+  bmSetTruth();
+}
+static void bmStart(void (*rate)(double, double[3])) {
+  g_bm = BodyMotion();
+  g_bm.t = g_sim_us * 1e-6;
+  g_bm.rate = rate;
+  g_truth.truthFn = truthBodyMotion;
+  bmSetTruth();
+}
+static void bmStop() { g_truth.truthFn = nullptr; g_bm.rate = nullptr; }
+
+// Run until an epoch has consumed every sample produced so far, so the filter
+// state and the truth refer to the same instant.
+template <typename OnEpoch>
+static void runToEpoch(TriSenseINS &ins, TriSense &sensor, OnEpoch onEpoch) {
+  for (int i = 0; i < 100; i++) {
+    g_sim_us += 250;
+    if (!ins.update()) continue;
+    onEpoch();
+    if (ins.getImuBacklog() == 0 && fabs(sensor.imu.lastReadT - g_bm.t) < 1e-9) return;
+  }
+}
+static void runToEpoch(TriSenseINS &ins, TriSense &sensor) { runToEpoch(ins, sensor, [] {}); }
+// Error of the estimate against the truth: total angle, and the component
+// about the vertical (the part no accelerometer leveling can see) [deg].
+static void bmErr(const TriSenseINS &ins, float &total, float &vertical) {
+  float R[3][3], T[3][3], E[3][3];
+  total = vertical = 999.0f;
+  if (!ins.getRotationMatrix(R)) return;
+  dqToMat(g_bm.q, T);
+  total = rotErrDeg(R, T);
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) E[i][j] = R[i][0] * T[j][0] + R[i][1] * T[j][1] + R[i][2] * T[j][2];
+  vertical = 0.5f * (E[1][0] - E[0][1]) / D2R;
+}
+
+// Pure strapdown of what TriSenseINS hands INSLIB, see test 11. The simulated
+// gyro has no bias, so the rate is integrated as it is handed over. (INSLIB
+// subtracts its bias estimate from it; with the mean of the epoch that is
+// all it does, and per-sample integration removes the same estimate before
+// integrating and adds it back afterwards, so in both modes the raw rate is
+// the one to compare against the truth.)
+struct StrapdownCheck {
+  double q[4];
+  explicit StrapdownCheck(const double q0[4]) { for (int i = 0; i < 4; i++) q[i] = q0[i]; }
+  double v[3] = {0, 0, 0};  // NED velocity from the specific force [m/s]
+  void epoch(const TriSenseINS &ins) {
+    const ins_measurements_t &m = ins.lastMeasurements();
+    double w[3];
+    for (int i = 0; i < 3; i++) w[i] = (double)m.gyr.data[i];
+    const double h = m.strapdown_dt_sec;
+    // INSLIB's velocity step: R_k (f h + 1/2 (w x f) h^2) + g h, with R_k the
+    // attitude before this epoch's rotation.
+    {
+      float R[3][3];
+      dqToMat(q, R);
+      const double f[3] = {m.acc.data[0], m.acc.data[1], m.acc.data[2]};
+      const double wf[3] = {w[1] * f[2] - w[2] * f[1], w[2] * f[0] - w[0] * f[2], w[0] * f[1] - w[1] * f[0]};
+      double ib[3];
+      for (int i = 0; i < 3; i++) ib[i] = f[i] * h + 0.5 * wf[i] * h * h;
+      for (int i = 0; i < 3; i++) v[i] += R[i][0] * ib[0] + R[i][1] * ib[1] + R[i][2] * ib[2];
+      v[2] += G * h;
+    }
+    const double a = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) * h;
+    const double s = a > 1e-12 ? sin(0.5 * a) / (a / h) : 0.5 * h;
+    const double e[4] = {cos(0.5 * a), w[0] * s, w[1] * s, w[2] * s};
+    double qn[4];
+    dqMul(q, e, qn);
+    const double nr = 1.0 / sqrt(qn[0] * qn[0] + qn[1] * qn[1] + qn[2] * qn[2] + qn[3] * qn[3]);
+    for (int i = 0; i < 4; i++) q[i] = qn[i] * nr;
+  }
+  void err(float &total, float &vertical) const {
+    float R[3][3], T[3][3], E[3][3];
+    dqToMat(q, R);
+    dqToMat(g_bm.q, T);
+    total = rotErrDeg(R, T);
+    for (int i = 0; i < 3; i++)
+      for (int j = 0; j < 3; j++) E[i][j] = R[i][0] * T[j][0] + R[i][1] * T[j][1] + R[i][2] * T[j][2];
+    vertical = 0.5f * (E[1][0] - E[0][1]) / D2R;
+  }
+};
+
+static double g_coneHz = 0, g_coneDeg = 0, g_motionStart = 0;
+static void rateCone(double t, double w[3]) {
+  // Body rate of constant amplitude whose axis turns in the x-y plane: the
+  // z axis sweeps a cone of half-angle ~coneDeg at coneHz, and the body
+  // really turns about z at ~Omega alpha^2 / 2 (the coning motion proper).
+  if (t < g_motionStart) { w[0] = w[1] = w[2] = 0; return; }
+  const double W = 2 * M_PI * g_coneHz, a = W * g_coneDeg * M_PI / 180.0;
+  w[0] = a * cos(W * (t - g_motionStart));
+  w[1] = a * sin(W * (t - g_motionStart));
+  w[2] = 0;
+}
+
+static int g_flipMode = 0;  // 0: fixed axis, 1: tumbling axis
+static void rateFlip(double t, double w[3]) {
+  const double u = t - g_motionStart;
+  w[0] = w[1] = w[2] = 0;
+  if (u < 0 || u > 1.0) return;
+  // 400 deg/s, eased in and out over 20 ms.
+  double env = 1.0;
+  if (u < 0.02) env = 0.5 - 0.5 * cos(M_PI * u / 0.02);
+  if (u > 0.98) env = 0.5 - 0.5 * cos(M_PI * (1.0 - u) / 0.02);
+  double ax[3] = {1, 2, 3};
+  if (g_flipMode == 1) {
+    ax[0] = 1.0;
+    ax[1] = 0.8 * sin(2 * M_PI * 2.0 * u);
+    ax[2] = 0.6 * cos(2 * M_PI * 1.3 * u);
+  }
+  const double n = sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+  for (int i = 0; i < 3; i++) w[i] = 400.0 * M_PI / 180.0 * env * ax[i] / n;
 }
 
 static float angDiff(float a, float b) {
@@ -390,6 +579,91 @@ int main() {
       }
       float r, p, y;
       CHECK(ins.getRPY(r, p, y) && fabsf(r) < 1.0f && fabsf(p) < 1.0f, "still level: roll %.2f pitch %.2f", r, p);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // What the integration itself contributes is measured with a pure strapdown:
+  // the rate TriSenseINS hands INSLIB each epoch (lastMeasurements(), minus
+  // the gyro bias the filter subtracts), integrated exactly the way INSLIB's
+  // strapdown does it, with no leveling or other correction on top. The full
+  // filter's error is reported alongside: the ARS's accelerometer leveling
+  // lags a fast cone/flip (10 Hz low-pass) and adds an error of its own that
+  // has nothing to do with how the samples are integrated.
+  printf("11) Coning, 60 s: mean of the epoch vs per-sample integration\n");
+  {
+    const double cases[3][2] = {{10, 5}, {30, 3}, {50, 2}};
+    for (int c = 0; c < 3; c++) {
+      float sdVert[2], sdTot[2], fVert[2], fTot[2];
+      for (int ps = 0; ps < 2; ps++) {
+        TriSenseINS ins(sensor);
+        TriSenseINSConfig cfg = timingConfig();
+        cfg.perSampleIntegration = ps;
+        g_coneHz = cases[c][0];
+        g_coneDeg = cases[c][1];
+        g_motionStart = 1e30;
+        bmStart(rateCone);
+        ins.begin(cfg);
+        runLoop(ins, 5, 250);
+        g_motionStart = g_sim_us * 1e-6;
+        runToEpoch(ins, sensor);
+        StrapdownCheck sd(g_bm.q);
+        const uint64_t end = g_sim_us + 60000000ULL;
+        while (g_sim_us < end) {
+          g_sim_us += 250;
+          if (ins.update()) sd.epoch(ins);
+        }
+        runToEpoch(ins, sensor, [&] { sd.epoch(ins); });
+        sd.err(sdTot[ps], sdVert[ps]);
+        bmErr(ins, fTot[ps], fVert[ps]);
+        bmStop();
+      }
+      printf("  info: %2.0f Hz %.0f deg: strapdown drift about the vertical %8.3f deg (mean) vs %7.4f deg (per sample),"
+             " total %.3f vs %.4f\n", cases[c][0], cases[c][1], sdVert[0], sdVert[1], sdTot[0], sdTot[1]);
+      printf("  info:              full ARS filter: vertical %.2f vs %.2f deg, total %.2f vs %.2f deg\n", fVert[0],
+             fVert[1], fTot[0], fTot[1]);
+      CHECK(sdTot[1] < 0.5f, "%.0f Hz / %.0f deg: per-sample strapdown error %.4f deg < 0.5 deg after 60 s", cases[c][0],
+            cases[c][1], sdTot[1]);
+      CHECK(sdTot[1] * 10.0f < sdTot[0], "%.0f Hz / %.0f deg: per-sample at least 10x better than the mean (%.3f)",
+            cases[c][0], cases[c][1], sdTot[0]);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  printf("12) Flip: 400 deg/s for 1 s, no magnetometer\n");
+  {
+    for (g_flipMode = 0; g_flipMode < 2; g_flipMode++) {
+      float sdErr[2], sdV, fErr[2], fV, vErr[2];
+      for (int ps = 0; ps < 2; ps++) {
+        TriSenseINS ins(sensor);
+        TriSenseINSConfig cfg = timingConfig();
+        cfg.perSampleIntegration = ps;
+        g_motionStart = 1e30;
+        bmStart(rateFlip);
+        ins.begin(cfg);
+        runLoop(ins, 5, 250);
+        g_motionStart = g_sim_us * 1e-6;
+        runToEpoch(ins, sensor);
+        StrapdownCheck sd(g_bm.q);
+        const uint64_t end = g_sim_us + 1050000ULL;
+        while (g_sim_us < end) {
+          g_sim_us += 250;
+          if (ins.update()) sd.epoch(ins);
+        }
+        runToEpoch(ins, sensor, [&] { sd.epoch(ins); });
+        sd.err(sdErr[ps], sdV);
+        vErr[ps] = (float)sqrt(sd.v[0] * sd.v[0] + sd.v[1] * sd.v[1] + sd.v[2] * sd.v[2]);
+        bmErr(ins, fErr[ps], fV);
+        bmStop();
+      }
+      const char *name = g_flipMode ? "tumbling axis" : "fixed axis (1,2,3)";
+      printf("  info: %s: strapdown error %.4f deg (mean) vs %.4f deg (per sample); full ARS filter %.2f vs %.2f deg\n",
+             name, sdErr[0], sdErr[1], fErr[0], fErr[1]);
+      printf("  info: %s: strapdown velocity error (truth: at rest) %.3f m/s (mean) vs %.4f m/s (per sample)\n", name,
+             vErr[0], vErr[1]);
+      CHECK(sdErr[1] < 0.05f, "%s: per-sample strapdown error %.4f deg after 400 deg", name, sdErr[1]);
+      CHECK(vErr[1] < 0.02f, "%s: per-sample velocity error %.4f m/s (sculling)", name, vErr[1]);
+      CHECK(fErr[1] < 3.0f && fErr[0] < 3.0f, "%s: full filter within 3 deg (%.2f / %.2f)", name, fErr[0], fErr[1]);
     }
   }
 

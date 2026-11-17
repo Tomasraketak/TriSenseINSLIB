@@ -59,6 +59,60 @@ void diagCov(float Q[9], float varN, float varE, float varD) {
   Q[8] = varD;
 }
 
+// Hamilton product, scalar first.
+void qMul(const float a[4], const float b[4], float o[4]) {
+  o[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
+  o[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
+  o[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
+  o[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
+}
+
+// Rotation vector -> quaternion. One IMU sample turns by well under 0.2 rad
+// (2000 deg/s at 1 kHz is 0.035 rad), where the series below is exact to
+// float precision and saves a sin/cos per sample.
+void qExp(const float th[3], float q[4]) {
+  const float x2 = th[0] * th[0] + th[1] * th[1] + th[2] * th[2];
+  float c, s;
+  if (x2 < 0.04f) {
+    c = 1.0f - x2 * (1.0f / 8.0f) + x2 * x2 * (1.0f / 384.0f);
+    s = 0.5f - x2 * (1.0f / 48.0f) + x2 * x2 * (1.0f / 3840.0f);
+  } else {
+    const float x = sqrtf(x2);
+    c = cosf(0.5f * x);
+    s = sinf(0.5f * x) / x;
+  }
+  q[0] = c;
+  q[1] = th[0] * s; q[2] = th[1] * s; q[3] = th[2] * s;
+}
+
+// Quaternion -> rotation vector (the inverse of qExp, |angle| <= pi).
+void qLog(const float qin[4], float th[3]) {
+  float q[4] = {qin[0], qin[1], qin[2], qin[3]};
+  if (q[0] < 0.0f) { q[0] = -q[0]; q[1] = -q[1]; q[2] = -q[2]; q[3] = -q[3]; }
+  const float v = sqrtf(q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  const float angle = 2.0f * atan2f(v, q[0]);
+  const float k = (v > 1e-7f) ? angle / v : 2.0f / (q[0] > 0.0f ? q[0] : 1.0f);
+  th[0] = q[1] * k; th[1] = q[2] * k; th[2] = q[3] * k;
+}
+
+// v_out = R(q) v.
+void qRotate(const float q[4], const float v[3], float o[3]) {
+  const float w = q[0], x = q[1], y = q[2], z = q[3];
+  // t = 2 (q_vec x v); o = v + w t + q_vec x t
+  const float tx = 2.0f * (y * v[2] - z * v[1]);
+  const float ty = 2.0f * (z * v[0] - x * v[2]);
+  const float tz = 2.0f * (x * v[1] - y * v[0]);
+  o[0] = v[0] + w * tx + (y * tz - z * ty);
+  o[1] = v[1] + w * ty + (z * tx - x * tz);
+  o[2] = v[2] + w * tz + (x * ty - y * tx);
+}
+
+void cross3(const float a[3], const float b[3], float o[3]) {
+  o[0] = a[1] * b[2] - a[2] * b[1];
+  o[1] = a[2] * b[0] - a[0] * b[2];
+  o[2] = a[0] * b[1] - a[1] * b[0];
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -199,6 +253,8 @@ bool TriSenseINS::reset() {
   memset(_accSum, 0, sizeof(_accSum));
   memset(_gyrSum, 0, sizeof(_gyrSum));
   _imuCount = 0;
+  resetEpochIntegrals();
+  _havePrevTheta = false;
   memset(&_pending, 0, sizeof(_pending));
   memset(&_meas, 0, sizeof(_meas));
   _droppedEpochs = 0;
@@ -388,6 +444,7 @@ void TriSenseINS::drainImu(uint64_t now) {
     float a[3], g[3];
     toFRD(ax * G_MPS2, ay * G_MPS2, az * G_MPS2, a);
     toFRD(gx * DEG2RADF, gy * DEG2RADF, gz * DEG2RADF, g);
+    if (_cfg.perSampleIntegration) integrateSample(a, g);
     _accSum[0] += a[0]; _accSum[1] += a[1]; _accSum[2] += a[2];
     _gyrSum[0] += g[0]; _gyrSum[1] += g[1]; _gyrSum[2] += g[2];
     _imuCount++;
@@ -408,6 +465,53 @@ void TriSenseINS::drainImu(uint64_t now) {
     _lostAccounted = total;
     _calWindowClean = false;
   }
+}
+
+void TriSenseINS::resetEpochIntegrals() {
+  _dq[0] = 1.0f; _dq[1] = _dq[2] = _dq[3] = 0.0f;
+  _dvb[0] = _dvb[1] = _dvb[2] = 0.0f;
+}
+
+// One IMU sample into the epoch's increments (perSampleIntegration):
+//   delta angle    theta_k = (w_k - b) T, plus the two-sample coning term
+//                  1/12 theta_{k-1} x theta_k (Savage / Bortz), so the sum of
+//                  sample-rate increments follows a rotation axis that moves
+//                  between samples;
+//   attitude       dq <- dq * exp(theta_k)        (body_start <- body_k);
+//   velocity       dv <- dv + R(dq_{k-1}) (f_k T + 1/2 theta_k x f_k T),
+//                  i.e. f_k rotated to the epoch-start frame at mid-sample
+//                  (sculling).
+// The gyro bias the filter currently estimates is taken out first and added
+// back in runEpoch(), so it is not rotated along with the body.
+void TriSenseINS::integrateSample(const float a[3], const float g[3]) {
+  if (_imuCount == 0) {
+    float b[3] = {0.0f, 0.0f, 0.0f};
+    if (!ins_get_bias_gyr(&_suite.ins, b)) ahrs_get_bias_gyr(&_suite.ars, b);
+    memcpy(_intBias, b, sizeof(_intBias));
+  }
+  const float T = (float)_samplePeriodS;
+  float th[3] = {(g[0] - _intBias[0]) * T, (g[1] - _intBias[1]) * T, (g[2] - _intBias[2]) * T};
+  float rot[3] = {th[0], th[1], th[2]};
+  if (_havePrevTheta) {
+    float c[3];
+    cross3(_prevTheta, th, c);
+    rot[0] += c[0] / 12.0f; rot[1] += c[1] / 12.0f; rot[2] += c[2] / 12.0f;
+  }
+  memcpy(_prevTheta, th, sizeof(_prevTheta));
+  _havePrevTheta = true;
+
+  float dvk[3] = {a[0] * T, a[1] * T, a[2] * T}, c[3];
+  cross3(th, dvk, c);
+  dvk[0] += 0.5f * c[0]; dvk[1] += 0.5f * c[1]; dvk[2] += 0.5f * c[2];
+  float dvs[3];
+  qRotate(_dq, dvk, dvs);
+  _dvb[0] += dvs[0]; _dvb[1] += dvs[1]; _dvb[2] += dvs[2];
+
+  float e[4], qn[4];
+  qExp(rot, e);
+  qMul(_dq, e, qn);
+  const float nrm = 1.0f / sqrtf(qn[0] * qn[0] + qn[1] * qn[1] + qn[2] * qn[2] + qn[3] * qn[3]);
+  for (int i = 0; i < 4; i++) _dq[i] = qn[i] * nrm;
 }
 
 // The sample clock of the IMU against the MCU crystal, over >= 2 s windows
@@ -534,6 +638,32 @@ void TriSenseINS::runEpoch(uint64_t now, float dt) {
     _meas.gyr.Qll_diag[i] = _cfg.gyroNoisePSD;
     _accSum[i] = 0.0f;
     _gyrSum[i] = 0.0f;
+  }
+
+  // --- Per-sample integration: replace the means by the constant rate and
+  // specific force that reproduce the epoch's increments in INSLIB's
+  // strapdown. Its attitude step is exactly exp((w - b) dt), so
+  // w = log(dq) / Tn + b. Its velocity step is R_k (f dt + 1/2 (w x f) dt^2),
+  // so f = (I + K)^-1 dv / Tn with K = dt/2 [w x], whose closed-form inverse
+  // is I - K / (1 + s) + K^2 / (1 + s), s = |dt/2 w|^2. Tn is the time the
+  // samples cover; dt may be longer if samples were lost, and the rate and
+  // force then stand in for the missing time, as the plain means do.
+  if (_cfg.perSampleIntegration) {
+    const float Tn = (float)_imuCount * (float)_samplePeriodS;
+    float rv[3], w[3];
+    qLog(_dq, rv);
+    for (int i = 0; i < 3; i++) w[i] = rv[i] / Tn;
+    float gsf[3] = {_dvb[0] / Tn, _dvb[1] / Tn, _dvb[2] / Tn};
+    float k[3] = {0.5f * dt * w[0], 0.5f * dt * w[1], 0.5f * dt * w[2]};
+    const float sn = k[0] * k[0] + k[1] * k[1] + k[2] * k[2];
+    float kg[3], kkg[3];
+    cross3(k, gsf, kg);
+    cross3(k, kg, kkg);
+    for (int i = 0; i < 3; i++) {
+      _meas.gyr.data[i] = w[i] + _intBias[i];
+      _meas.acc.data[i] = gsf[i] + (kkg[i] - kg[i]) / (1.0f + sn);
+    }
+    resetEpochIntegrals();
   }
   _imuCount = 0;
 

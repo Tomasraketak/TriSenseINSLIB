@@ -272,7 +272,10 @@ calibration, a 1 g vertical boost tracked by the barometric channel, a static
 GNSS solution and a vehicle accelerating with GNSS. The simulated IMU has the
 real 128-packet FIFO, so the tests also cover the epoch timing: sample-count dt,
 an IMU sample clock 1.5 % off nominal, a 200 ms loop stall that overflows the
-FIFO, and the per-call packet cap.
+FIFO, and the per-call packet cap. Tests 11-12 drive the IMU from a body rate
+integrated in double precision (5 us steps) and compare the optional
+per-sample integration (`perSampleIntegration`) with the default epoch mean:
+a 10-50 Hz, 2-5 deg cone for 60 s, and a 400 deg/s flip for 1 s.
 
 ```sh
 make -C tests/host
@@ -297,6 +300,13 @@ sensor hardware or real-world tuning.
   a mutex): the fix is handed over through a plain struct.
 - Heading from NMEA course over ground is off by default (`gnssUseCourseAsHeading`),
   as it is only valid for vehicles that cannot move sideways.
+- IMU samples are averaged per epoch by default, which loses the coning motion
+  inside an epoch: in the host test a 30 Hz / 3 deg cone drifts the pure
+  strapdown by 57 deg in 60 s. `perSampleIntegration = true` integrates every
+  sample (0.05 deg). It is off by default only so that existing setups keep
+  their behaviour. Under sustained fast coning the ARS's own accelerometer
+  leveling (10 Hz low-pass) still adds drift of its own, which this does not
+  address.
 - With INSLIB's logging turned off (`LOG_LEVEL 0`), a filter that refuses to
   start says nothing. `diagnostics()` has the counters to find out why.
 

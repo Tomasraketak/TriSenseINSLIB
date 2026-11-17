@@ -131,6 +131,16 @@ struct TriSenseINSConfig {
   // integrated angle. true: measure the real sample period against the MCU
   // crystal (2 s windows, clamped to +-5 %) and integrate with that.
   bool calibrateImuPeriod = true;
+  // false (default): each epoch hands INSLIB the plain mean of its IMU
+  // samples - exact for rotation about a fixed axis, but it drops the coning
+  // (and sculling) motion inside the epoch, which a rocket's vibration and
+  // roll-while-pitching produce. true: every sample's delta angle is
+  // integrated into the epoch's delta quaternion (with the two-sample coning
+  // correction) and its velocity increment into the epoch's start frame
+  // (sculling), and INSLIB gets the constant rate / specific force that
+  // reproduce exactly those increments over the epoch. Costs some 100 float
+  // operations per sample (no trig), a few microseconds per epoch.
+  bool perSampleIntegration = false;
   // Boot-time gyro bias estimate (board must be still). INSLIB keeps
   // estimating the bias afterwards; this only makes the start cleaner.
   bool     calibrateGyro = true;
@@ -432,6 +442,13 @@ private:
   float    _gyrSum[3];
   uint32_t _imuCount = 0;
 
+  // Per-sample integration (perSampleIntegration), see drainImu().
+  float    _dq[4];        // body at epoch start <- body now
+  float    _dvb[3];       // velocity increment in the epoch-start body frame [m/s]
+  float    _prevTheta[3]; // last sample's delta angle, for the coning term
+  float    _intBias[3];   // gyro bias removed before integrating
+  bool     _havePrevTheta = false;
+
   // IMU timing (see update()).
   uint16_t _imuCap = 64;
   bool     _fifoMode = true;
@@ -478,6 +495,8 @@ private:
   void     toFRD(float x, float y, float z, float out[3]) const;
   bool     readMagnetometer(float out[3]);
   void     drainImu(uint64_t nowUs);
+  void     integrateSample(const float a[3], const float g[3]);
+  void     resetEpochIntegrals();
   void     resetImuTiming(uint64_t nowUs);
   void     calibrateSamplePeriod(uint64_t nowUs);
   void     runEpoch(uint64_t nowUs, float dt);
