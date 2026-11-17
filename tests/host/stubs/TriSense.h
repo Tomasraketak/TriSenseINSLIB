@@ -36,7 +36,20 @@ struct SimIMU {
   double odrHz = 1000.0;     // true sample rate (tests can detune it)
   int    reportedOdrHz = 1000;
   uint64_t nextNs = 0;       // time of the next sample to be produced
-  struct Pkt { float a[3], g[3]; double t; } q[CAP];
+  struct Pkt { float a[3], g[3]; double t; uint16_t ts; } q[CAP];
+  // FIFO timestamps (sensor clock: 1 us per LSB of the sensor's own time, so
+  // exact multiples of the nominal period), as Voltino_TriSense >= 1.6 reports
+  // them. tsEnabled = false behaves like a driver/sensor without them.
+  bool tsEnabled = true;
+  uint32_t tsTicks = 0;
+  uint16_t lastTs = 0;
+  bool lastTsValid = false;
+  // Every dropEvery-th packet is corrupt and skipped by the driver (0 = never).
+  uint32_t dropEvery = 0, dropped = 0, pktIndex = 0;
+  // Filter calls (Voltino_TriSense >= 1.6).
+  uint16_t aafGyro = 585, aafAccel = 1163;
+  float uiGyro = 250, uiAccel = 250;
+  int filterCalls = 0;
   double lastReadT = 0;  // sample time of the last packet handed out [s]
   int head = 0, count = 0;
   uint32_t chipLost = 0;      // the chip's own counter (since flush)
@@ -49,11 +62,18 @@ struct SimIMU {
   int getODRHz() { return reportedOdrHz; }
   void setFIFOMode(ICM_FIFO_MODE m) { mode = m; }
   ICM_FIFO_MODE getFIFOMode() { return mode; }
-  void flushFIFO() { produce(); count = 0; head = 0; chipLost = 0; chipLostSeen = 0; }
+  void flushFIFO() { produce(); count = 0; head = 0; chipLost = 0; chipLostSeen = 0; lastTsValid = false; }
+  bool hasFIFOTimestamp() { return tsEnabled && lastTsValid; }
+  uint16_t getFIFOTimestamp() { return lastTs; }
+  bool setAntiAliasFilter(uint16_t g, uint16_t a) { aafGyro = g; aafAccel = a; filterCalls++; return true; }
+  bool setUIFilter(float g, float a) { uiGyro = g; uiAccel = a; filterCalls++; return true; }
+  // The driver's fallback for an ODR it cannot service: half the rate, FIFO flushed.
+  bool stepDownODR() { produce(); odrHz /= 2; reportedOdrHz /= 2; flushFIFO(); return true; }
   uint32_t getLostPacketCount() { return driverLost; }
 
   void sample(Pkt &p, double t) {
     p.t = t;
+    p.ts = (uint16_t)tsTicks;
     if (g_truth.truthFn) g_truth.truthFn(t);
     for (int i = 0; i < 3; i++) {
       p.a[i] = g_truth.acc[i] + sim_noise(g_truth.accNoiseG * g_truth.vib);
@@ -72,6 +92,7 @@ struct SimIMU {
         chipLost++;
       }
       produced++;
+      tsTicks += (uint32_t)(1000000 / reportedOdrHz);
       nextNs = (uint64_t)((double)nextNs + stepNs + 0.5);
     }
   }
@@ -96,9 +117,16 @@ struct SimIMU {
     }
     produce();
     refillCheck();
+    if (dropEvery && count > 0 && (++pktIndex % dropEvery) == 0) {  // corrupt packet, skipped
+      head = (head + 1) % CAP;
+      count--;
+      dropped++;
+    }
     if (count == 0) return false;
     const Pkt &p = q[head];
     lastReadT = p.t;
+    lastTs = p.ts;
+    lastTsValid = true;
     head = (head + 1) % CAP;
     count--;
     ax = p.a[0]; ay = p.a[1]; az = p.a[2]; gx = p.g[0]; gy = p.g[1]; gz = p.g[2];

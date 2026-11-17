@@ -907,6 +907,89 @@ int main() {
     }
   }
 
+  // -------------------------------------------------------------------------
+  printf("17) Voltino_TriSense FIFO timestamps, ODR step-down, IMU filters\n");
+  {
+    // 2 % of the packets are corrupt and skipped by the driver while turning
+    // at 90 deg/s. Only the timestamps can tell (the FIFO never overflows).
+    for (int ts = 1; ts >= 0; ts--) {
+      TriSenseINS ins(sensor);
+      sensor.imu.tsEnabled = ts;
+      sensor.imu.dropped = 0;
+      g_yawRate = 90.0f;
+      g_truth.truthFn = truthYawRate;
+      g_motionT0 = 1e30;
+      CHECK(ins.begin(timingConfig()), "begin()");
+      runLoop(ins, 5, 250);
+      sensor.imu.dropEvery = 50;
+      g_motionT0 = g_sim_us * 1e-6;
+      g_motionT1 = g_motionT0 + 10.0;
+      runLoop(ins, 11, 250);
+      sensor.imu.dropEvery = 0;
+      const float err = insErrDeg(ins, 0, 0, yawAt(g_sim_us * 1e-6));
+      printf("  info: timestamps %s: %u packets dropped, %u found (%u by timestamp), period %.2f us, error %.2f deg\n",
+             ts ? "on " : "off", (unsigned)sensor.imu.dropped, (unsigned)ins.getImuLostSamples(),
+             (unsigned)ins.getImuTimestampGapSamples(), ins.getImuSamplePeriodUs(), err);
+      if (ts) {
+        CHECK(ins.imuTimestampsUsed(), "timestamps in use");
+        // (the very last drop may not have a successor packet read yet)
+        CHECK(ins.getImuLostSamples() + 1 >= sensor.imu.dropped && ins.getImuLostSamples() <= sensor.imu.dropped,
+              "every dropped packet found (%u of %u)",
+              (unsigned)ins.getImuLostSamples(), (unsigned)sensor.imu.dropped);
+        CHECK(fabsf(ins.getImuSamplePeriodUs() - 1000.0f) < 0.5f, "clock calibration not fooled: %.2f us",
+              ins.getImuSamplePeriodUs());
+        CHECK(err < 0.5f, "attitude error %.2f deg after 900 deg with 2 %% of the packets dropped", err);
+      } else {
+        CHECK(!ins.imuTimestampsUsed() && ins.getImuLostSamples() == 0, "without timestamps the drops go unseen");
+      }
+      g_truth.truthFn = nullptr;
+      g_motionT0 = g_motionT1 = 1e30;
+      sensor.imu.tsEnabled = true;
+    }
+
+    // The driver halves the ODR mid-turn (stepDownODR, e.g. it could not keep up).
+    {
+      TriSenseINS ins(sensor);
+      g_yawRate = 90.0f;
+      g_truth.truthFn = truthYawRate;
+      g_motionT0 = 1e30;
+      ins.begin(timingConfig());
+      runLoop(ins, 5, 250);
+      g_motionT0 = g_sim_us * 1e-6;
+      g_motionT1 = g_motionT0 + 6.0;
+      runLoop(ins, 3, 250);
+      sensor.imu.stepDownODR();
+      runLoop(ins, 4, 250);
+      const float err = insErrDeg(ins, 0, 0, yawAt(g_sim_us * 1e-6));
+      CHECK(ins.getImuOdrHz() == 500 && fabsf(ins.getImuSamplePeriodUs() - 2000.0f) < 1.0f,
+            "follows the ODR step-down: %u Hz, period %.1f us", (unsigned)ins.getImuOdrHz(),
+            ins.getImuSamplePeriodUs());
+      CHECK(ins.getImuLostSamples() <= 1, "no phantom lost samples at the new rate (%u)",
+            (unsigned)ins.getImuLostSamples());
+      CHECK(err < 0.5f, "attitude error %.2f deg across the ODR change", err);
+      g_truth.truthFn = nullptr;
+      g_motionT0 = g_motionT1 = 1e30;
+      sensor.imu.odrHz = 1000.0;
+      sensor.imu.reportedOdrHz = 1000;
+    }
+
+    // Filters from the config, only when asked for.
+    {
+      TriSenseINS ins(sensor);
+      const int calls = sensor.imu.filterCalls;
+      ins.begin(timingConfig());
+      CHECK(sensor.imu.filterCalls == calls, "default config leaves the IMU filters alone");
+      TriSenseINSConfig c = timingConfig();
+      c.imuGyroAafHz = 400;
+      c.imuGyroUiFilterHz = 100;
+      ins.begin(c);
+      CHECK(sensor.imu.aafGyro == 400 && sensor.imu.aafAccel == 1163, "gyro AAF %u Hz, accel AAF kept at %u Hz",
+            sensor.imu.aafGyro, sensor.imu.aafAccel);
+      CHECK(sensor.imu.uiGyro == 100.0f && sensor.imu.uiAccel == 250.0f, "gyro UI filter %.0f Hz, accel kept %.0f Hz",
+            sensor.imu.uiGyro, sensor.imu.uiAccel);
+    }
+  }
+
   printf(failures ?"\n%d check(s) FAILED\n" : "\nall checks passed\n", failures);
   return failures ? 1 : 0;
 }

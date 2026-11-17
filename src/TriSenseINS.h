@@ -131,6 +131,19 @@ struct TriSenseINSConfig {
   // integrated angle. true: measure the real sample period against the MCU
   // crystal (2 s windows, clamped to +-5 %) and integrate with that.
   bool calibrateImuPeriod = true;
+  // IMU filters (Voltino_TriSense >= the release with setAntiAliasFilter /
+  // setUIFilter; ignored with an older driver). 0 = leave the sensor as it is
+  // (power-on: gyro AAF 585 Hz, accel AAF 1163 Hz, UI filter
+  // max(400 Hz, ODR)/4 2nd order). The anti-alias filter is what keeps motor
+  // and airframe vibration above the output Nyquist (ODR/2) from folding down
+  // into the band the filter integrates; at 1 kHz something like 400 Hz is a
+  // sensible start. Applied by begin() when configureSensors is set; costs
+  // ~80 ms per call (the driver power-cycles the sensors as the datasheet
+  // requires), so it never happens in flight.
+  uint16_t imuGyroAafHz = 0;
+  uint16_t imuAccelAafHz = 0;
+  float    imuGyroUiFilterHz = 0.0f;
+  float    imuAccelUiFilterHz = 0.0f;
   // false (default): each epoch hands INSLIB the plain mean of its IMU
   // samples - exact for rotation about a fixed axis, but it drops the coning
   // (and sculling) motion inside the epoch, which a rocket's vibration and
@@ -400,8 +413,15 @@ public:
   float    getLastEpochDt() const      { return _lastDt; }
   // the IMU sample period in use [us] (calibrated if calibrateImuPeriod);
   float    getImuSamplePeriodUs() const { return (float)(_samplePeriodS * 1e6); }
-  // packets read from the FIFO per update() call at most (resolved config).
+  // packets read from the FIFO per update() call at most (resolved config);
   uint16_t getImuMaxPacketsPerUpdate() const { return _imuCap; }
+  // whether the FIFO packets carry the sensor's own timestamps (driver and
+  // sensor support them) - then every gap between two samples is seen, not
+  // only FIFO overflows - and how many lost samples were found that way;
+  bool     imuTimestampsUsed() const       { return _tsValid; }
+  uint32_t getImuTimestampGapSamples() const { return _lostTs; }
+  // the IMU ODR in use [Hz] (follows the driver, e.g. after stepDownODR()).
+  uint16_t getImuOdrHz() const { return _odrHz; }
   // Free stack measured right before the last filter call [bytes], -1 if the
   // platform cannot tell. stackOk() is false once it was ever below
   // TRISENSE_INS_STACK_NEEDED - expect corrupted memory then, see README.
@@ -463,6 +483,14 @@ private:
   uint16_t _fifoCapacity = 128;    // packets the hardware FIFO holds
   double   _samplePeriodNominalS = 0.001;
   double   _samplePeriodS = 0.001;
+  double   _clockScale = 1.0;       // IMU sample clock: true / nominal period
+  uint16_t _odrHz = 1000;
+  double   _epochSampleTimeS = 0;   // time covered by the samples read this epoch
+  uint16_t _prevTs = 0;             // FIFO timestamp of the previous packet
+  bool     _tsValid = false;
+  bool     _tsSkipGap = false;      // the next gap is an overflow already counted
+  uint32_t _lostTs = 0;
+  uint32_t _lostOwn = 0;            // timestamp gaps + overflow inference
   uint64_t _sensorTimeNs = 0;      // filter time: advances by each epoch's dt
   uint64_t _lastDrainUs = 0;
   uint32_t _backlogAfter = 0;
@@ -507,6 +535,8 @@ private:
   void     resetEpochIntegrals();
   void     resetImuTiming(uint64_t nowUs);
   void     calibrateSamplePeriod(uint64_t nowUs);
+  void     setOdr(int odrHz);
+  void     configureImuFilters();
   void     runEpoch(uint64_t nowUs, float dt);
   float    stateStdDev(int idx) const;
   static int freeStackBytes();

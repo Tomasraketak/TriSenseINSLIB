@@ -132,7 +132,7 @@ Heights and vertical speeds are **positive up**. Every getter returns `false`
 | Sensor errors | `getAccelBias`, `getGyroBias`, `getAccelBiasStdDev`, `getGyroBiasStdDev` |
 | Status | `getMode()` → `None` / `AttitudeOnly` / `Coasting` / `Full`, `modeName()`, `isReady`, `hasAttitude`, `hasPosition`, `isZuptActive`, `isVerticalZuptActive`, `getDeadReckoningMs` |
 | Health | `getEpochRateHz`, `getLastUpdateUs`, `getMaxUpdateUs`, `getDroppedEpochs`, `getImuLostPackets` (driver count), `getFreeStack`, `stackOk` |
-| IMU timing | `getImuLostSamples` (lost samples charged to dt), `getLastEpochSamples`, `getLastEpochDt`, `getImuBacklog`, `getImuMaxBacklog`, `getDtMismatchCount`, `getImuSamplePeriodUs`, `getImuMaxPacketsPerUpdate` |
+| IMU timing | `getImuLostSamples` (lost samples charged to dt), `getLastEpochSamples`, `getLastEpochDt`, `getImuBacklog`, `getImuMaxBacklog`, `getDtMismatchCount`, `getImuSamplePeriodUs`, `getImuOdrHz`, `getImuMaxPacketsPerUpdate`, `imuTimestampsUsed`, `getImuTimestampGapSamples` |
 | Raw | `diagnostics()` (INSLIB `ins_diag_t`), `suite()` (the INSLIB `nav_suite_t`), `lastMeasurements()`, `config()` |
 
 Everything in `TriSenseINSConfig` has a working default; see the comments in
@@ -237,6 +237,21 @@ Magnetic Model tables about 11 KB of flash.
 
 ---
 
+## Optional Voltino_TriSense features
+
+TriSenseINSLIB builds against any Voltino_TriSense from 1.5.0 on. Features of
+newer drivers are detected at compile time and used when present:
+
+- **FIFO timestamps** (`hasFIFOTimestamp()`): each packet's timestamp from the
+  sensor's own clock shows every missing sample - not only FIFO overflows but
+  also packets the driver drops as corrupt - so the epoch dt stays exact
+  (`imuTimestampsUsed()`, `getImuTimestampGapSamples()`).
+- **Anti-alias and UI filters** (`setAntiAliasFilter()`, `setUIFilter()`):
+  `TriSenseINSConfig::imuGyroAafHz`, `imuAccelAafHz`, `imuGyroUiFilterHz`,
+  `imuAccelUiFilterHz`; 0 (default) leaves the sensor as it is.
+
+An ODR change by the driver (`stepDownODR()`) is followed with any version.
+
 ## How INSLIB is built
 
 INSLIB and KFCore are vendored in [`src/inslib/`](src/inslib) (INSLIB
@@ -297,7 +312,9 @@ calibration, a 1 g vertical boost tracked by the barometric channel, a static
 GNSS solution and a vehicle accelerating with GNSS. The simulated IMU has the
 real 128-packet FIFO, so the tests also cover the epoch timing: sample-count dt,
 an IMU sample clock 1.5 % off nominal, a 200 ms loop stall that overflows the
-FIFO, and the per-call packet cap. Tests 11-12 drive the IMU from a body rate
+FIFO, and the per-call packet cap. Test 17 covers what newer Voltino_TriSense
+drivers add: FIFO timestamps (every dropped packet found), an ODR step-down
+mid-turn, and the anti-alias / UI filter settings. Tests 11-12 drive the IMU from a body rate
 integrated in double precision (5 us steps) and compare the optional
 per-sample integration (`perSampleIntegration`) with the default epoch mean:
 a 10-50 Hz, 2-5 deg cone for 60 s, and a 400 deg/s flip for 1 s. Tests 13-16
