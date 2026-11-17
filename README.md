@@ -106,12 +106,12 @@ Heights and vertical speeds are **positive up**. Every getter returns `false`
 | Call | |
 |---|---|
 | `begin()` / `begin(TriSenseINSConfig)` | After `sensor.beginAll()`. Sets IMU 1 kHz + FIFO, baro 50 Hz / OSR x8 / no IIR, calibrates the gyro, starts the filter |
-| `update()` | Call from `loop()` as often as possible. Drains the IMU FIFO, polls mag + baro, runs a filter epoch at 200 Hz. `true` when an epoch ran |
+| `update()` | Call from `loop()` as often as possible. Drains the IMU FIFO (at most `imuMaxPacketsPerUpdate` packets per call), polls mag + baro, runs a filter epoch at `navRateHz` (200 Hz). The epoch's dt is the number of IMU samples it consumed (plus any the FIFO lost) times the calibrated sample period, cross-checked against `micros()`. `true` when an epoch ran |
 | `reset()` | Restart the filter, keep calibration and settings |
 | `feedGnss(lat, lon, altMSL, hdop, sats, speed, course, ageMs, geoidSep)` | A GNSS fix (e.g. TinyGPSPlus). HDOP → covariance, latency compensated |
 | `feedGnss(TriSenseGnssFix)` | Same, with optional receiver accuracies and full NED velocity (u-blox UBX) |
 | `feedSpeed(mps, sigma, delayMs)` | Odometry speed |
-| `feedHeading(deg, sigmaDeg, delayMs)` | External heading (dual-antenna GNSS, launch rail, …) |
+| `feedHeading(deg, sigmaDeg, delayMs)` | External heading (dual-antenna GNSS, launch rail, …): compass direction of `headingAxis` (default FRD x) |
 | `zeroVelocityUpdate()` | "Not moving" for the next epoch |
 | `setAutoZupt(bool)` | Automatic stillness detection on/off (turn off in flight) |
 | `setMagCalibration(hard[3], soft[3][3])` | From the MotionCal example, in TriSense axes |
@@ -131,7 +131,8 @@ Heights and vertical speeds are **positive up**. Every getter returns `false`
 | Height | `getBaroAltitude(h, vz)`, `getHeight`, `getVerticalSpeed`, `getHeightEllipsoid`, `getHeightMSL`, `getPressureAltitude` |
 | Sensor errors | `getAccelBias`, `getGyroBias`, `getAccelBiasStdDev`, `getGyroBiasStdDev` |
 | Status | `getMode()` → `None` / `AttitudeOnly` / `Coasting` / `Full`, `modeName()`, `isReady`, `hasAttitude`, `hasPosition`, `isZuptActive`, `isVerticalZuptActive`, `getDeadReckoningMs` |
-| Health | `getEpochRateHz`, `getLastUpdateUs`, `getMaxUpdateUs`, `getDroppedEpochs`, `getImuLostPackets`, `getFreeStack`, `stackOk` |
+| Health | `getEpochRateHz`, `getLastUpdateUs`, `getMaxUpdateUs`, `getDroppedEpochs`, `getImuLostPackets` (driver count), `getFreeStack`, `stackOk` |
+| IMU timing | `getImuLostSamples` (lost samples charged to dt), `getLastEpochSamples`, `getLastEpochDt`, `getImuBacklog`, `getImuMaxBacklog`, `getDtMismatchCount`, `getImuSamplePeriodUs`, `getImuOdrHz`, `getImuMaxPacketsPerUpdate`, `imuTimestampsUsed`, `getImuTimestampGapSamples` |
 | Raw | `diagnostics()` (INSLIB `ins_diag_t`), `suite()` (the INSLIB `nav_suite_t`), `lastMeasurements()`, `config()` |
 
 Everything in `TriSenseINSConfig` has a working default; see the comments in
@@ -171,7 +172,13 @@ Everything in `TriSenseINSConfig` has a working default; see the comments in
 **Rockets.** Mount the board with X along the rocket's axis (nose = forward).
 On the pad the pitch is then +90°, where roll and yaw Euler angles are
 undefined (gimbal lock); use `getQuaternion()` / `getRotationMatrix()` for
-attitude there. Height and vertical speed (`getBaroAltitude`) are unaffected.
+attitude there. The filters themselves do not use Euler angles there: the
+magnetometer heading, the initial alignment and external headings keep working
+at pitch ±90° (for `feedHeading()` set `headingAxis` to an axis across the
+body, e.g. a launch rail azimuth for FRD z). Alternatively mount the board
+across the rocket as Daidalos does (board −Y to the nose, roll −90° on the
+rail), which keeps the Euler angles defined on the pad. Height and vertical
+speed (`getBaroAltitude`) are unaffected.
 Expect the barometer to read wrong around transonic speeds and in the ejection
 gas; the vertical channel will show it.
 
@@ -230,11 +237,45 @@ Magnetic Model tables about 11 KB of flash.
 
 ---
 
+## Optional Voltino_TriSense features
+
+TriSenseINSLIB builds against any Voltino_TriSense from 1.5.0 on. Features of
+newer drivers are detected at compile time and used when present:
+
+- **FIFO timestamps** (`hasFIFOTimestamp()`): each packet's timestamp from the
+  sensor's own clock shows every missing sample - not only FIFO overflows but
+  also packets the driver drops as corrupt - so the epoch dt stays exact
+  (`imuTimestampsUsed()`, `getImuTimestampGapSamples()`).
+- **Anti-alias and UI filters** (`setAntiAliasFilter()`, `setUIFilter()`):
+  `TriSenseINSConfig::imuGyroAafHz`, `imuAccelAafHz`, `imuGyroUiFilterHz`,
+  `imuAccelUiFilterHz`; 0 (default) leaves the sensor as it is.
+
+An ODR change by the driver (`stepDownODR()`) is followed with any version.
+
 ## How INSLIB is built
 
-INSLIB and KFCore are vendored, **unmodified**, in [`src/inslib/`](src/inslib)
-(INSLIB **v1.4.2**, exact commits and file hashes in
-[`src/inslib/VERSIONS.txt`](src/inslib/VERSIONS.txt)).
+INSLIB and KFCore are vendored in [`src/inslib/`](src/inslib) (INSLIB
+**v1.4.2**, exact commits and file hashes in
+[`src/inslib/VERSIONS.txt`](src/inslib/VERSIONS.txt)), unmodified except for
+the patches in [`tools/inslib_patches/`](tools/inslib_patches), which
+`tools/update_inslib.sh` applies to the upstream checkout on every
+re-vendoring. They are plain `git format-patch` files against the INSLIB
+repository, ready to be offered upstream:
+
+- `0001` - attitude without Euler singularities: the AHRS fuses the
+  magnetometer as the azimuth of the field in the navigation frame
+  (`h_n = R * mag_b`) instead of a tilt-compensated Euler yaw, so it keeps
+  working at pitch +-90 deg (skipped only where the horizontal field vanishes,
+  near a magnetic pole); the magnetometer AHRS starts from a TRIAD attitude
+  (gravity + field) instead of roll/pitch + heading; and absolute heading
+  measurements refer to a configurable body axis (`headingAxis`, default FRD
+  x) and are skipped only while that axis is vertical. INSLIB's own unit
+  tests and replay gates (`make test`: core, math, AHRS, baro, simulated,
+  Crazyflie, datasets) pass with it, and the worst-case stack of
+  `nav_suite_update()` is unchanged.
+
+Never edit `src/inslib/` directly: change or add a patch and re-run the
+script.
 
 The Arduino build compiles every `.c` under `src/` and cannot pass `-D` flags
 to a library, but INSLIB's array sizes (and therefore its stack use) are set
@@ -247,7 +288,7 @@ compiled through a one-line wrapper `src/inslib_tu_<name>.c`:
 #include "inslib/ins.c.inc"
 ```
 
-That does what `-D` would have done, without patching INSLIB.
+That does what `-D` would have done, without touching the INSLIB sources.
 `TriSenseINS.h` includes the same config header before the INSLIB headers, so
 every translation unit agrees on the layout of `ins_t`.
 
@@ -268,7 +309,19 @@ build the examples and update the version in this README and in
 simulated TriSense and checks the outputs against the simulated truth: level
 and tilted attitude, magnetic vs. true heading, upside-down mounting, hard-iron
 calibration, a 1 g vertical boost tracked by the barometric channel, a static
-GNSS solution and a vehicle accelerating with GNSS.
+GNSS solution and a vehicle accelerating with GNSS. The simulated IMU has the
+real 128-packet FIFO, so the tests also cover the epoch timing: sample-count dt,
+an IMU sample clock 1.5 % off nominal, a 200 ms loop stall that overflows the
+FIFO, and the per-call packet cap. Test 17 covers what newer Voltino_TriSense
+drivers add: FIFO timestamps (every dropped packet found), an ODR step-down
+mid-turn, and the anti-alias / UI filter settings. Tests 11-12 drive the IMU from a body rate
+integrated in double precision (5 us steps) and compare the optional
+per-sample integration (`perSampleIntegration`) with the default epoch mean:
+a 10-50 Hz, 2-5 deg cone for 60 s, and a 400 deg/s flip for 1 s. Tests 13-16
+cover attitudes at and through pitch +-90 deg: the Daidalos rail pose (roll
+-90), holding body x vertical for 60 s with the magnetometer and a gyro bias,
+initial alignment in 50 random poses (with and without magnetometer), and a
+heading fed for a body axis other than x while x points straight up.
 
 ```sh
 make -C tests/host
@@ -293,6 +346,13 @@ sensor hardware or real-world tuning.
   a mutex): the fix is handed over through a plain struct.
 - Heading from NMEA course over ground is off by default (`gnssUseCourseAsHeading`),
   as it is only valid for vehicles that cannot move sideways.
+- IMU samples are averaged per epoch by default, which loses the coning motion
+  inside an epoch: in the host test a 30 Hz / 3 deg cone drifts the pure
+  strapdown by 57 deg in 60 s. `perSampleIntegration = true` integrates every
+  sample (0.05 deg). It is off by default only so that existing setups keep
+  their behaviour. Under sustained fast coning the ARS's own accelerometer
+  leveling (10 Hz low-pass) still adds drift of its own, which this does not
+  address.
 - With INSLIB's logging turned off (`LOG_LEVEL 0`), a filter that refuses to
   start says nothing. `diagnostics()` has the counters to find out why.
 

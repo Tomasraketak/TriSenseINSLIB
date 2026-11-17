@@ -263,19 +263,38 @@ int nav_suite_init(nav_suite_t* s, const ins_init_t* init, const ins_options_t* 
  * magnetic heading into a true one. */
 /* @satisfies REQ-SUITE-029 */
 static void nav_suite_ahrs_start(nav_suite_t* s, ahrs_t* a, const ahrs_config_t* cfg,
-                                 ins_time_us_t t)
+                                 ins_time_us_t t, const float* q_init)
 {
     (void)ahrs_init(a, cfg, t);
+    /* A start attitude known as a quaternion (TRIAD) replaces the one built
+       from cfg->rpy_init_rad, before the declination re-frame below. */
+    if (q_init != NULL) { ahrs_set_initial_attitude(a, q_init); }
     if (a == &s->ahrs && s->mag_model.valid)
     {
         ahrs_set_position(a, s->mag_model.lat_rad, s->mag_model.lon_rad, s->mag_model.year);
     }
 }
 
+/* Start attitude of the magnetometer AHRS by TRIAD (ahrs_triad_attitude):
+ * straight from the down direction and the field, so it holds at any pitch,
+ * +/-90 deg included. The Euler angles go to cfg only for the record (the
+ * filter is started from q). False at a magnetic pole: the caller then falls
+ * back to the tilt plus de-tilted heading. */
+static bool nav_suite_triad(const float down_b[3], const float* mag_b, ahrs_config_t* c,
+                            float q[4])
+{
+    if (mag_b == NULL || !ahrs_triad_attitude(down_b, mag_b, q)) { return false; }
+    float R[9];
+    ins_quat_to_rotmat(q, R);
+    ins_rotmat_to_rpy(R, &c->rpy_init_rad[0], &c->rpy_init_rad[1], &c->rpy_init_rad[2]);
+    return true;
+}
+
 /* Bootstrap an AHRS instance once the leveling window is full: roll/pitch from
  * accelerometer leveling over the window, widened if it was not quasi-static
- * (REQ-SUITE-028); yaw from the magnetometer (AHRS mode), or (unless
- * keep_init_yaw) 0 (ARS mode without a known initial attitude). keep_init_yaw
+ * (REQ-SUITE-028); yaw from the magnetometer (AHRS mode, the whole attitude by
+ * TRIAD from gravity and the field), or (unless keep_init_yaw) 0 (ARS mode
+ * without a known initial attitude). keep_init_yaw
  * preserves whatever is already in cfg->rpy_init_rad[2] (the ARS's known
  * initial yaw, see nav_suite_t.ars_yaw_from_init) and is only ever true for the
  * ARS call site, never for the magnetometer AHRS. A gyro bias the instance
@@ -305,17 +324,28 @@ static void nav_suite_ahrs_bootstrap(nav_suite_t* s, ahrs_t* a, ahrs_config_t* c
                 c.rpy_init_rad[i]        = s->ins.init.rpy_init_rad[i];
                 c.rpy_init_stddev_rad[i] = NAV_SUITE_AHRS_INIT_RP_STDDEV;
             }
-            nav_suite_ahrs_start(s, a, &c, m->timestamp);
+            nav_suite_ahrs_start(s, a, &c, m->timestamp, NULL);
             return;
         }
+        float q_ars[4];
         if (mag_b != NULL &&
             ahrs_get_rpy(&s->ars, &c.rpy_init_rad[0], &c.rpy_init_rad[1], &c.rpy_init_rad[2]) &&
             ahrs_get_rpy_stddev(&s->ars, &c.rpy_init_stddev_rad[0], &c.rpy_init_stddev_rad[1],
-                                &sd_y))
+                                &sd_y) &&
+            ahrs_get_quaternion(&s->ars, q_ars))
         {
-            c.rpy_init_rad[2] = ahrs_mag_heading(mag_b, c.rpy_init_rad[0], c.rpy_init_rad[1]);
+            /* Down as the ARS sees it (its tilt), heading from the field. */
+            float R_ars[9], q[4];
+            ins_quat_to_rotmat(q_ars, R_ars);
+            const float down_b[3] = {MAT_ELEM(R_ars, 2, 0, 3, 3), MAT_ELEM(R_ars, 2, 1, 3, 3),
+                                     MAT_ELEM(R_ars, 2, 2, 3, 3)};
+            const bool  triad     = nav_suite_triad(down_b, mag_b, &c, q);
+            if (!triad)
+            {
+                c.rpy_init_rad[2] = ahrs_mag_heading(mag_b, c.rpy_init_rad[0], c.rpy_init_rad[1]);
+            }
             c.rpy_init_stddev_rad[2] = NAV_SUITE_AHRS_INIT_YAW_STDDEV;
-            nav_suite_ahrs_start(s, a, &c, m->timestamp);
+            nav_suite_ahrs_start(s, a, &c, m->timestamp, triad ? q : NULL);
             return;
         }
         /* No ARS to take it from: level like any other start. */
@@ -329,8 +359,14 @@ static void nav_suite_ahrs_bootstrap(nav_suite_t* s, ahrs_t* a, ahrs_config_t* c
 
     cfg->rpy_init_rad[0] = roll;
     cfg->rpy_init_rad[1] = pitch;
-    if (!keep_init_yaw)
+    /* Down in the body frame. roll/pitch are atan2 of the median specific
+       force, so this is exactly -f/|f| again, also at pitch +/-90 deg. */
+    const float down_b[3] = {-sinf(pitch), sinf(roll) * cosf(pitch), cosf(roll) * cosf(pitch)};
+    float       q_triad[4];
+    const bool  triad = !keep_init_yaw && nav_suite_triad(down_b, mag_b, cfg, q_triad);
+    if (!keep_init_yaw && !triad)
     {
+        /* No magnetometer: tilt from gravity, heading 0. */
         cfg->rpy_init_rad[2] = (mag_b != NULL) ? ahrs_mag_heading(mag_b, roll, pitch) : 0.0f;
     }
     cfg->rpy_init_stddev_rad[0] = fmaxf(NAV_SUITE_AHRS_INIT_RP_STDDEV, rp_floor);
@@ -340,7 +376,7 @@ static void nav_suite_ahrs_bootstrap(nav_suite_t* s, ahrs_t* a, ahrs_config_t* c
 
     ahrs_config_t c = *cfg;
     (void)ahrs_get_bias_carry(a, c.gyr_bias_init_rps, c.gyr_bias_init_stddev_rps);
-    nav_suite_ahrs_start(s, a, &c, m->timestamp);
+    nav_suite_ahrs_start(s, a, &c, m->timestamp, triad ? q_triad : NULL);
 }
 
 /* IMU loss (REQ-SUITE-027): the ARS/AHRS and baro_alt never see the epochs

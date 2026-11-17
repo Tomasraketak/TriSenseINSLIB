@@ -1,0 +1,472 @@
+From dd402d478798f4af8ec9d00853221f9dcec15932 Mon Sep 17 00:00:00 2001
+From: TriSenseINSLIB <noreply@voltinolabs.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH] Attitude without Euler singularities: mag azimuth, TRIAD
+ alignment, heading axis
+
+ahrs_fuse_mag: heading measured as the azimuth of the field in the n-frame,
+h_n = R_b_to_n * mag_b, z = wrap(declination - atan2(h_E, h_N)), H = -e_z on
+the n-frame attitude error (same H as before, no Euler angles). Skipped only
+where the horizontal field vanishes (magnetic pole), not near pitch +-90.
+
+nav_suite: the magnetometer AHRS starts from a TRIAD attitude (gravity +
+field, new ahrs_triad_attitude / ahrs_set_initial_attitude) instead of
+leveling roll/pitch + de-tilted heading + ins_quat_from_rpy. Without a
+magnetometer: tilt from gravity, heading 0, as before.
+
+ins: new ins_options_t.heading_axis_b (default body x = ZYX yaw, unchanged
+behaviour). ins_fuse_yaw, the automotive course yaw and the auto-init yaw
+use the azimuth of that axis and skip only while it is vertical.
+---
+ src/ahrs.c      | 118 +++++++++++++++++++++++++++++++++++++-----------
+ src/ahrs.h      |  32 +++++++++++++
+ src/ins.c       |  63 +++++++++++++++++++-------
+ src/ins.h       |  14 +++++-
+ src/nav_suite.c |  54 ++++++++++++++++++----
+ 5 files changed, 228 insertions(+), 53 deletions(-)
+
+diff --git a/src/ahrs.c b/src/ahrs.c
+index 21ff092..d88909a 100644
+--- a/src/ahrs.c
++++ b/src/ahrs.c
+@@ -574,13 +574,23 @@ static void ahrs_mag_detilt(const float mag_b[3], float roll_rad, float pitch_ra
+     *hy            = ty;
+ }
+ 
+-/* Magnetometer heading (AHRS mode): scalar tilt-compensated heading
+- * measurement. Residual z = wrap(yaw_mag - yaw_nominal) = -dyaw, so
+- * H = [0 0 -1 0 0 0]. Only yaw is observed, roll/pitch stay untouched by
+- * magnetic disturbances. Once a position is known the WMM declination turns the
+- * magnetic heading into a true-north heading, and the measured field magnitude
+- * is checked against the WMM total field: a gross deviation downweights the
+- * sample instead of dropping it. */
++/* Magnetometer heading (AHRS mode): scalar heading measurement taken as the
++ * azimuth of the measured field in the n-frame,
++ *     h_n = R_b_to_n * mag_b,   azimuth = atan2(h_E, h_N),
++ * which with the right attitude points to magnetic north, i.e. equals the WMM
++ * declination once a position is known (zero before). Residual
++ *     z = wrap(declination - azimuth).
++ * The attitude error state of this filter lives in the n-frame (R_nominal =
++ * (I + [dx]_x) R_true, see ins_quat_small_angle_correction): its vertical
++ * component dx_z turns h_n, and with it the azimuth, by exactly dx_z, so
++ * z = -dx_z and H = [0 0 -1 0 0 0] - the same H as the former Euler-yaw
++ * formulation, without the Euler angles. The tilt components would move the
++ * azimuth too (through the dip of the field) but are deliberately left out of
++ * H: roll/pitch stay untouched by magnetic disturbances. With no Euler angle
++ * involved, pitch +/-90 deg is an ordinary attitude; the measurement is only
++ * skipped where the horizontal field itself vanishes (magnetic pole). The
++ * measured field magnitude is checked against the WMM total field: a gross
++ * deviation downweights the sample instead of dropping it. */
+ /* @satisfies REQ-AHRS-006 REQ-AHRS-014 REQ-AHRS-015 */
+ static void ahrs_fuse_mag(ahrs_t* a, const float mag_b[3])
+ {
+@@ -605,33 +615,30 @@ static void ahrs_fuse_mag(ahrs_t* a, const float mag_b[3])
+     float R_b_to_n[9];
+     ins_quat_to_rotmat(a->q, R_b_to_n);
+ 
+-    /* Yaw is ill-defined near pitch = +/-90 deg (gimbal lock) -> skip. */
+-    const float sp = -MAT_ELEM(R_b_to_n, 2, 0, 3, 3);
+-    if (sp > 0.99f || sp < -0.99f)
++    /* Horizontal part of the field in the n-frame. It must be usable relative
++       to the total field: near a magnetic pole the horizontal component
++       vanishes. */
++    float h_n[2];
++    int   i;
++    for (i = 0; i < 2; ++i)
+     {
+-        LOG_INFO("ahrs: magnetometer fusion skipped, pitch %.1f deg too close to +/-90 deg",
+-                 (double)RAD2DEG(asinf(sp)));
+-        return;
++        h_n[i] = MAT_ELEM(R_b_to_n, i, 0, 3, 3) * mag_b[0] +
++                 MAT_ELEM(R_b_to_n, i, 1, 3, 3) * mag_b[1] +
++                 MAT_ELEM(R_b_to_n, i, 2, 3, 3) * mag_b[2];
+     }
+-
+-    float roll, pitch, yaw_nom;
+-    ins_rotmat_to_rpy(R_b_to_n, &roll, &pitch, &yaw_nom);
+-
+-    /* De-tilted horizontal field must be usable (relative to the total
+-       field: near a magnetic pole the horizontal component vanishes). */
+-    float hx, hy;
+-    ahrs_mag_detilt(mag_b, roll, pitch, &hx, &hy);
+-    if (hx * hx + hy * hy < 1e-4f * mag_norm2)
++    if (h_n[0] * h_n[0] + h_n[1] * h_n[1] < 1e-4f * mag_norm2)
+     {
++        a->n_mag_skipped_weak_h++;
+         LOG_INFO("ahrs: magnetometer fusion skipped, horizontal field too weak");
+         return;
+     }
+ 
+-    /* Magnetic heading, corrected to true north by the WMM declination
+-       (zero until ahrs_set_position() is called). */
+-    const float yaw_mag = ins_wrap_pi_bounded(atan2f(-hy, hx) + a->declination_rad);
++    /* Field azimuth vs. where it should point: magnetic north, turned into a
++       true-north reference by the WMM declination (zero until
++       ahrs_set_position() is called). */
++    const float azimuth = atan2f(h_n[1], h_n[0]);
+ 
+-    float z = ins_wrap_pi_bounded(yaw_mag - yaw_nom);
++    float z = ins_wrap_pi_bounded(a->declination_rad - azimuth);
+     float R = qsquare(a->cfg.mag_yaw_stddev_rad);
+ 
+     /* Field-strength disturbance gate (opt-in): downweight (inflate R) once the
+@@ -654,7 +661,9 @@ static void ahrs_fuse_mag(ahrs_t* a, const float mag_b[3])
+     memset(Ht, 0, sizeof(Ht[0]) * (size_t)n);
+     Ht[2] = -1.0f;
+ 
+-    if (ahrs_fuse(a, &z, &R, Ht, 1, a->cfg.mag_chi2_threshold) == 0 && !a->declination_applied)
++    const bool fused = ahrs_fuse(a, &z, &R, Ht, 1, a->cfg.mag_chi2_threshold) == 0;
++    if (fused) { a->n_mag_fused++; }
++    if (fused && !a->declination_applied)
+     {
+         /* Referenced to magnetic north until a declination is applied, see
+            ahrs_set_position (REQ-AHRS-014). */
+@@ -1390,6 +1399,61 @@ float ahrs_mag_heading(const float mag_b[3], float roll_rad, float pitch_rad)
+     return atan2f(-hy, hx);
+ }
+ 
++/* TRIAD (Black 1964): the attitude straight from two vector observations,
++ * without Euler angles. The down direction is the primary (exact) vector, the
++ * field only fixes the rotation about it:
++ *     d = down_b / |down_b|,  e = (d x mag_b) / |d x mag_b|,  n = e x d
++ * are north, east and down expressed in the body frame, i.e. the rows of
++ * R_b_to_n. Magnetic north, like ahrs_mag_heading(). */
++/* @satisfies REQ-AHRS-012 */
++bool ahrs_triad_attitude(const float down_b[3], const float mag_b[3], float q[4])
++{
++    const float dn = SQRTF(qsquare(down_b[0]) + qsquare(down_b[1]) + qsquare(down_b[2]));
++    const float mn = SQRTF(qsquare(mag_b[0]) + qsquare(mag_b[1]) + qsquare(mag_b[2]));
++    if (!(dn > 0.0f) || !(mn > 0.0f) || !isfinite(dn) || !isfinite(mn)) { return false; }
++    const float d[3] = {down_b[0] / dn, down_b[1] / dn, down_b[2] / dn};
++    float       e[3];
++    ins_cross(d, mag_b, e);
++    const float en = SQRTF(qsquare(e[0]) + qsquare(e[1]) + qsquare(e[2]));
++    /* Horizontal field below 1 % of the total: at a magnetic pole the heading
++       is undefined (same limit as ahrs_fuse_mag). */
++    if (!(en > 1e-2f * mn)) { return false; }
++    e[0] /= en;
++    e[1] /= en;
++    e[2] /= en;
++    float nv[3];
++    ins_cross(e, d, nv);
++
++    float R[9];
++    int   j;
++    for (j = 0; j < 3; ++j)
++    {
++        MAT_ELEM(R, 0, j, 3, 3) = nv[j];
++        MAT_ELEM(R, 1, j, 3, 3) = e[j];
++        MAT_ELEM(R, 2, j, 3, 3) = d[j];
++    }
++    ins_matrix_to_quat(R, q);
++    ins_quat_normalize(q);
++    return true;
++}
++#endif /* AHRS_NO_MAG */
++
++void ahrs_set_initial_attitude(ahrs_t* a, const float q[4])
++{
++    if (a == NULL || !a->is_initialized || q == NULL) { return; }
++    float qn[4] = {q[0], q[1], q[2], q[3]};
++    ins_quat_normalize(qn);
++    if (!isfinite(qn[0]) || !isfinite(qn[1]) || !isfinite(qn[2]) || !isfinite(qn[3])) { return; }
++    memcpy(a->q, qn, sizeof(qn));
++    /* Same accelerometer low-pass seed as ahrs_init: f_b = -R' * g_n. */
++    float R[9];
++    int   i;
++    ins_quat_to_rotmat(a->q, R);
++    for (i = 0; i < 3; ++i) { a->acc_lowpass_mps2[i] = -AHRS_GRAVITY * MAT_ELEM(R, 2, i, 3, 3); }
++}
++
++#ifndef AHRS_NO_MAG
++
+ /* Widen the yaw variance to "heading unknown", never narrowing it
+  * (REQ-AHRS-014). Capped just below the yaw restart threshold while the
+  * attitude-precision watchdog is armed (REQ-AHRS-023): tripping it would
+diff --git a/src/ahrs.h b/src/ahrs.h
+index b2f8ed2..d54e361 100644
+--- a/src/ahrs.h
++++ b/src/ahrs.h
+@@ -376,6 +376,11 @@ typedef struct
+                                   diagnostic only, 0 whenever chi2_disable is
+                                   set */
+ 
++    /* Magnetometer heading fusions (AHRS mode), diagnostic only. */
++    uint32_t n_mag_fused;          /**< samples fused into the heading */
++    uint32_t n_mag_skipped_weak_h; /**< samples skipped because the
++                                        horizontal field was too weak (pole) */
++
+     /* Overconfidence / covariance-collapse watchdog (REQ-AHRS-020): the
+        attitude analogue of INS's REQ-NAV-040. Flags when the reported attitude
+        1-sigma becomes physically implausible. Purely diagnostic. Covers
+@@ -641,8 +646,35 @@ extern "C"
+      *  @param[in] pitch_rad Current pitch [rad].
+      *  @return Heading [rad] in (-pi, pi]. */
+     float ahrs_mag_heading(const float mag_b[3], float roll_rad, float pitch_rad);
++
++    /** @brief Attitude from gravity and the magnetic field (TRIAD).
++     *
++     *  Builds the body-to-n rotation directly from the two vectors, with no
++     *  Euler angles, so it is equally valid at pitch +/-90 deg. The down
++     *  direction is taken as exact, the field only fixes the rotation about
++     *  it. North is MAGNETIC north (declination not applied), as for
++     *  ahrs_mag_heading().
++     *
++     *  @param[in] down_b Direction of gravity (down) in the body frame, any
++     *             length; at rest that is -acc.
++     *  @param[in] mag_b Magnetometer, body frame (any unit).
++     *  @param[out] q Body-to-NED quaternion (Hamilton, scalar first).
++     *  @return false (q untouched) if either vector is zero or the field is
++     *          (nearly) parallel to gravity, i.e. at a magnetic pole. */
++    bool ahrs_triad_attitude(const float down_b[3], const float mag_b[3], float q[4]);
+ #endif /* AHRS_NO_MAG */
+ 
++    /** @brief Replace the attitude of a freshly initialised filter.
++     *
++     *  For a start attitude that is known as a quaternion rather than as
++     *  roll/pitch/yaw (e.g. from ahrs_triad_attitude()). Call right after
++     *  ahrs_init(), before ahrs_set_position(); the covariance from
++     *  cfg.rpy_init_stddev_rad (n-frame) is kept.
++     *
++     *  @param[in,out] a Initialised filter.
++     *  @param[in] q Body-to-NED quaternion (normalised here). */
++    void ahrs_set_initial_attitude(ahrs_t* a, const float q[4]);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/ins.c b/src/ins.c
+index e003091..385d0fb 100644
+--- a/src/ins.c
++++ b/src/ins.c
+@@ -1747,6 +1747,33 @@ static void ins_fuse_mag(ins_t* f, const ins_measurements_t* m)
+     }
+ }
+ 
++/* Azimuth [rad] of the heading axis (ins_options_t.heading_axis_b, default
++ * body x) for the attitude R_b_to_n. False while that axis is within
++ * asin(0.99) of the vertical, where its azimuth is undefined. For body x this
++ * is exactly the ZYX yaw and the former "pitch close to +/-90 deg" gate.
++ * A rotation psi_z about the vertical (the n-frame attitude error) changes the
++ * azimuth of any non-vertical axis by exactly psi_z, so the yaw residual keeps
++ * H = e_z on the attitude block (ins_fuse_yaw_residual). */
++static bool ins_heading_axis_azimuth(const ins_t* f, const float R_b_to_n[9], float* az)
++{
++    float       axis[3] = {f->opt.heading_axis_b[0], f->opt.heading_axis_b[1],
++                           f->opt.heading_axis_b[2]};
++    const float n2      = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
++    if (!(n2 > 1e-12f) || !isfinite(n2))
++    {
++        axis[0] = 1.0f;
++        axis[1] = 0.0f;
++        axis[2] = 0.0f;
++    }
++    float v[3];
++    mat3_mul_vec3(R_b_to_n, axis, v);
++    const float len2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
++    const float h2   = v[0] * v[0] + v[1] * v[1];
++    if (h2 < (1.0f - 0.99f * 0.99f) * len2) { return false; }
++    *az = atan2f(v[1], v[0]);
++    return true;
++}
++
+ /* Absolute yaw aiding (e.g. lighthouse/mocap pose orientation, dual-antenna
+  * GNSS heading, gyro compass). Fused as a scalar yaw-error measurement,
+  * optionally anchored in the history for delayed measurements. */
+@@ -1768,17 +1795,14 @@ static void ins_fuse_yaw(ins_t* f, const ins_measurements_t* m)
+     }
+     const float* R_tov = tov.R_b_to_n;
+ 
+-    /* Yaw is ill-defined near pitch = +/-90 deg -> skip. */
+-    const float sp = -MAT_ELEM(R_tov, 2, 0, 3, 3);
+-    if (sp > 0.99f || sp < -0.99f)
++    /* The heading of an axis close to the vertical is ill-defined -> skip. */
++    float yaw_nom;
++    if (!ins_heading_axis_azimuth(f, R_tov, &yaw_nom))
+     {
+-        LOG_INFO("ins: pitch close to +/- 90 deg -> skip yaw measurement ");
++        LOG_INFO("ins: heading axis close to vertical -> skip yaw measurement ");
+         return;
+     }
+ 
+-    float roll, pitch, yaw_nom;
+-    ins_rotmat_to_rpy(R_tov, &roll, &pitch, &yaw_nom);
+-
+     const float dyaw = ins_angle_diff(yaw_nom, m->yaw.yaw_rad);
+     if (ins_fuse_yaw_residual(f, dyaw, qsquare(m->yaw.stddev_rad), f->chi2_thr_yaw) == 0)
+     {
+@@ -3337,12 +3361,9 @@ static void ins_fuse_gnss_course_yaw(ins_t* f, const ins_measurements_t* m)
+     }
+     const float* R_tov = tov.R_b_to_n;
+ 
+-    /* Yaw is ill-defined near pitch = +/-90 deg (gimbal lock) -> skip. */
+-    const float sp = -MAT_ELEM(R_tov, 2, 0, 3, 3);
+-    if (sp > 0.99f || sp < -0.99f) { return; }
+-
+-    float roll, pitch, yaw_nom;
+-    ins_rotmat_to_rpy(R_tov, &roll, &pitch, &yaw_nom);
++    /* The heading of an axis close to the vertical is ill-defined -> skip. */
++    float yaw_nom;
++    if (!ins_heading_axis_azimuth(f, R_tov, &yaw_nom)) { return; }
+ 
+     const float course = atan2f(vE, vN);
+     const float dyaw   = ins_wrap_pi_bounded(yaw_nom - course);
+@@ -4763,9 +4784,19 @@ static float ins_autoinit_yaw(const ins_t* f, const ins_measurements_t* m, float
+     /* 1) External heading (dual-antenna GNSS, lighthouse pose, ...). */
+     if (m->yaw.is_valid && m->yaw.stddev_rad > 0.0f)
+     {
+-        LOG_INFO("ins: using supplied initial yaw: %.0f deg", (double)RAD2DEG(m->yaw.yaw_rad));
+-        *yaw_var = qsquare(m->yaw.stddev_rad);
+-        return m->yaw.yaw_rad;
++        /* The measurement is the azimuth of the heading axis: the ZYX yaw is
++           that minus the axis' azimuth at zero yaw (the identity for body x).
++           Unusable while the axis is vertical. */
++        float q0[4], R0[9], az0;
++        ins_quat_from_rpy(roll, pitch, 0.0f, q0);
++        ins_quat_to_rotmat(q0, R0);
++        if (ins_heading_axis_azimuth(f, R0, &az0))
++        {
++            const float yaw = ins_wrap_pi_bounded(m->yaw.yaw_rad - az0);
++            LOG_INFO("ins: using supplied initial yaw: %.0f deg", (double)RAD2DEG(yaw));
++            *yaw_var = qsquare(m->yaw.stddev_rad);
++            return yaw;
++        }
+     }
+ 
+     /* 2) External attitude hint's own yaw (REQ-NAV-048), e.g. nav_suite's
+diff --git a/src/ins.h b/src/ins.h
+index 49c8009..85a59b7 100644
+--- a/src/ins.h
++++ b/src/ins.h
+@@ -197,7 +197,8 @@ typedef struct
+  *
+  *  E.g. from a lighthouse/mocap pose, a dual-antenna GNSS heading or a gyro
+  *  compass. ZYX (Tait-Bryan) yaw of the body relative to NED, same convention
+- *  as ins_get_rpy().
++ *  as ins_get_rpy() - more generally, the azimuth of the body axis set in
++ *  ins_options_t.heading_axis_b (default x, for which the two are the same).
+  *
+  *  Any single-turn convention is accepted and normalized internally. A heading
+  *  beyond one full turn is treated as a unit or unwrapping error: dropped and
+@@ -968,6 +969,17 @@ typedef struct
+      * epoch, the filter stops and re-arms with its biases carried. nav_suite
+      * hands the same value to the ARS/AHRS and baro_alt. */
+     float imu_loss_timeout_sec; /**< [s] (0 -> default) */
++
++    /* Heading axis: the body axis whose azimuth (direction in the horizontal
++     * plane, from north towards east) an absolute heading measurement
++     * reports, for ins_meas_yaw_t and the automotive course yaw. All zero ->
++     * the body x axis, for which the azimuth is exactly the ZYX yaw. A heading
++     * measurement is skipped only while THIS axis is within asin(0.99) (~82
++     * deg) of the vertical, where its azimuth is undefined - not whenever the
++     * pitch is near +-90 deg. E.g. a rocket that reports the heading of an
++     * axis across its body keeps fusing it while it points straight up. Need
++     * not be normalised. */
++    float heading_axis_b[3]; /**< body frame (0,0,0 -> (1,0,0)) */
+ } ins_options_t;
+ 
+ /** @brief Nominal state vector (float-only, local n-frame). */
+diff --git a/src/nav_suite.c b/src/nav_suite.c
+index 6fed068..0044580 100644
+--- a/src/nav_suite.c
++++ b/src/nav_suite.c
+@@ -263,19 +263,38 @@ int nav_suite_init(nav_suite_t* s, const ins_init_t* init, const ins_options_t*
+  * magnetic heading into a true one. */
+ /* @satisfies REQ-SUITE-029 */
+ static void nav_suite_ahrs_start(nav_suite_t* s, ahrs_t* a, const ahrs_config_t* cfg,
+-                                 ins_time_us_t t)
++                                 ins_time_us_t t, const float* q_init)
+ {
+     (void)ahrs_init(a, cfg, t);
++    /* A start attitude known as a quaternion (TRIAD) replaces the one built
++       from cfg->rpy_init_rad, before the declination re-frame below. */
++    if (q_init != NULL) { ahrs_set_initial_attitude(a, q_init); }
+     if (a == &s->ahrs && s->mag_model.valid)
+     {
+         ahrs_set_position(a, s->mag_model.lat_rad, s->mag_model.lon_rad, s->mag_model.year);
+     }
+ }
+ 
++/* Start attitude of the magnetometer AHRS by TRIAD (ahrs_triad_attitude):
++ * straight from the down direction and the field, so it holds at any pitch,
++ * +/-90 deg included. The Euler angles go to cfg only for the record (the
++ * filter is started from q). False at a magnetic pole: the caller then falls
++ * back to the tilt plus de-tilted heading. */
++static bool nav_suite_triad(const float down_b[3], const float* mag_b, ahrs_config_t* c,
++                            float q[4])
++{
++    if (mag_b == NULL || !ahrs_triad_attitude(down_b, mag_b, q)) { return false; }
++    float R[9];
++    ins_quat_to_rotmat(q, R);
++    ins_rotmat_to_rpy(R, &c->rpy_init_rad[0], &c->rpy_init_rad[1], &c->rpy_init_rad[2]);
++    return true;
++}
++
+ /* Bootstrap an AHRS instance once the leveling window is full: roll/pitch from
+  * accelerometer leveling over the window, widened if it was not quasi-static
+- * (REQ-SUITE-028); yaw from the magnetometer (AHRS mode), or (unless
+- * keep_init_yaw) 0 (ARS mode without a known initial attitude). keep_init_yaw
++ * (REQ-SUITE-028); yaw from the magnetometer (AHRS mode, the whole attitude by
++ * TRIAD from gravity and the field), or (unless keep_init_yaw) 0 (ARS mode
++ * without a known initial attitude). keep_init_yaw
+  * preserves whatever is already in cfg->rpy_init_rad[2] (the ARS's known
+  * initial yaw, see nav_suite_t.ars_yaw_from_init) and is only ever true for the
+  * ARS call site, never for the magnetometer AHRS. A gyro bias the instance
+@@ -305,17 +324,28 @@ static void nav_suite_ahrs_bootstrap(nav_suite_t* s, ahrs_t* a, ahrs_config_t* c
+                 c.rpy_init_rad[i]        = s->ins.init.rpy_init_rad[i];
+                 c.rpy_init_stddev_rad[i] = NAV_SUITE_AHRS_INIT_RP_STDDEV;
+             }
+-            nav_suite_ahrs_start(s, a, &c, m->timestamp);
++            nav_suite_ahrs_start(s, a, &c, m->timestamp, NULL);
+             return;
+         }
++        float q_ars[4];
+         if (mag_b != NULL &&
+             ahrs_get_rpy(&s->ars, &c.rpy_init_rad[0], &c.rpy_init_rad[1], &c.rpy_init_rad[2]) &&
+             ahrs_get_rpy_stddev(&s->ars, &c.rpy_init_stddev_rad[0], &c.rpy_init_stddev_rad[1],
+-                                &sd_y))
++                                &sd_y) &&
++            ahrs_get_quaternion(&s->ars, q_ars))
+         {
+-            c.rpy_init_rad[2] = ahrs_mag_heading(mag_b, c.rpy_init_rad[0], c.rpy_init_rad[1]);
++            /* Down as the ARS sees it (its tilt), heading from the field. */
++            float R_ars[9], q[4];
++            ins_quat_to_rotmat(q_ars, R_ars);
++            const float down_b[3] = {MAT_ELEM(R_ars, 2, 0, 3, 3), MAT_ELEM(R_ars, 2, 1, 3, 3),
++                                     MAT_ELEM(R_ars, 2, 2, 3, 3)};
++            const bool  triad     = nav_suite_triad(down_b, mag_b, &c, q);
++            if (!triad)
++            {
++                c.rpy_init_rad[2] = ahrs_mag_heading(mag_b, c.rpy_init_rad[0], c.rpy_init_rad[1]);
++            }
+             c.rpy_init_stddev_rad[2] = NAV_SUITE_AHRS_INIT_YAW_STDDEV;
+-            nav_suite_ahrs_start(s, a, &c, m->timestamp);
++            nav_suite_ahrs_start(s, a, &c, m->timestamp, triad ? q : NULL);
+             return;
+         }
+         /* No ARS to take it from: level like any other start. */
+@@ -329,8 +359,14 @@ static void nav_suite_ahrs_bootstrap(nav_suite_t* s, ahrs_t* a, ahrs_config_t* c
+ 
+     cfg->rpy_init_rad[0] = roll;
+     cfg->rpy_init_rad[1] = pitch;
+-    if (!keep_init_yaw)
++    /* Down in the body frame. roll/pitch are atan2 of the median specific
++       force, so this is exactly -f/|f| again, also at pitch +/-90 deg. */
++    const float down_b[3] = {-sinf(pitch), sinf(roll) * cosf(pitch), cosf(roll) * cosf(pitch)};
++    float       q_triad[4];
++    const bool  triad = !keep_init_yaw && nav_suite_triad(down_b, mag_b, cfg, q_triad);
++    if (!keep_init_yaw && !triad)
+     {
++        /* No magnetometer: tilt from gravity, heading 0. */
+         cfg->rpy_init_rad[2] = (mag_b != NULL) ? ahrs_mag_heading(mag_b, roll, pitch) : 0.0f;
+     }
+     cfg->rpy_init_stddev_rad[0] = fmaxf(NAV_SUITE_AHRS_INIT_RP_STDDEV, rp_floor);
+@@ -340,7 +376,7 @@ static void nav_suite_ahrs_bootstrap(nav_suite_t* s, ahrs_t* a, ahrs_config_t* c
+ 
+     ahrs_config_t c = *cfg;
+     (void)ahrs_get_bias_carry(a, c.gyr_bias_init_rps, c.gyr_bias_init_stddev_rps);
+-    nav_suite_ahrs_start(s, a, &c, m->timestamp);
++    nav_suite_ahrs_start(s, a, &c, m->timestamp, triad ? q_triad : NULL);
+ }
+ 
+ /* IMU loss (REQ-SUITE-027): the ARS/AHRS and baro_alt never see the epochs

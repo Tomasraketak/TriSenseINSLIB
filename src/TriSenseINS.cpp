@@ -59,6 +59,86 @@ void diagCov(float Q[9], float varN, float varE, float varD) {
   Q[8] = varD;
 }
 
+// Hamilton product, scalar first.
+void qMul(const float a[4], const float b[4], float o[4]) {
+  o[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
+  o[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
+  o[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
+  o[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
+}
+
+// Rotation vector -> quaternion. One IMU sample turns by well under 0.2 rad
+// (2000 deg/s at 1 kHz is 0.035 rad), where the series below is exact to
+// float precision and saves a sin/cos per sample.
+void qExp(const float th[3], float q[4]) {
+  const float x2 = th[0] * th[0] + th[1] * th[1] + th[2] * th[2];
+  float c, s;
+  if (x2 < 0.04f) {
+    c = 1.0f - x2 * (1.0f / 8.0f) + x2 * x2 * (1.0f / 384.0f);
+    s = 0.5f - x2 * (1.0f / 48.0f) + x2 * x2 * (1.0f / 3840.0f);
+  } else {
+    const float x = sqrtf(x2);
+    c = cosf(0.5f * x);
+    s = sinf(0.5f * x) / x;
+  }
+  q[0] = c;
+  q[1] = th[0] * s; q[2] = th[1] * s; q[3] = th[2] * s;
+}
+
+// Quaternion -> rotation vector (the inverse of qExp, |angle| <= pi).
+void qLog(const float qin[4], float th[3]) {
+  float q[4] = {qin[0], qin[1], qin[2], qin[3]};
+  if (q[0] < 0.0f) { q[0] = -q[0]; q[1] = -q[1]; q[2] = -q[2]; q[3] = -q[3]; }
+  const float v = sqrtf(q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  const float angle = 2.0f * atan2f(v, q[0]);
+  const float k = (v > 1e-7f) ? angle / v : 2.0f / (q[0] > 0.0f ? q[0] : 1.0f);
+  th[0] = q[1] * k; th[1] = q[2] * k; th[2] = q[3] * k;
+}
+
+// v_out = R(q) v.
+void qRotate(const float q[4], const float v[3], float o[3]) {
+  const float w = q[0], x = q[1], y = q[2], z = q[3];
+  // t = 2 (q_vec x v); o = v + w t + q_vec x t
+  const float tx = 2.0f * (y * v[2] - z * v[1]);
+  const float ty = 2.0f * (z * v[0] - x * v[2]);
+  const float tz = 2.0f * (x * v[1] - y * v[0]);
+  o[0] = v[0] + w * tx + (y * tz - z * ty);
+  o[1] = v[1] + w * ty + (z * tx - x * tz);
+  o[2] = v[2] + w * tz + (x * ty - y * tx);
+}
+
+void cross3(const float a[3], const float b[3], float o[3]) {
+  o[0] = a[1] * b[2] - a[2] * b[1];
+  o[1] = a[2] * b[0] - a[0] * b[2];
+  o[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+// Optional Voltino_TriSense features, detected at compile time so the library
+// still builds against a driver release without them (the int/long overload
+// pair picks the first version whenever its return-type expression compiles).
+template <typename IMU>
+auto imuTimestamp(IMU &imu, uint16_t &ts, int) -> decltype(imu.hasFIFOTimestamp(), bool()) {
+  if (!imu.hasFIFOTimestamp()) return false;
+  ts = imu.getFIFOTimestamp();
+  return true;
+}
+template <typename IMU>
+bool imuTimestamp(IMU &, uint16_t &, long) { return false; }
+
+template <typename IMU>
+auto imuSetAaf(IMU &imu, uint16_t g, uint16_t a, int) -> decltype(imu.setAntiAliasFilter(g, a)) {
+  return imu.setAntiAliasFilter(g, a);
+}
+template <typename IMU>
+bool imuSetAaf(IMU &, uint16_t, uint16_t, long) { return false; }
+
+template <typename IMU>
+auto imuSetUi(IMU &imu, float g, float a, int) -> decltype(imu.setUIFilter(g, a)) {
+  return imu.setUIFilter(g, a);
+}
+template <typename IMU>
+bool imuSetUi(IMU &, float, float, long) { return false; }
+
 }  // namespace
 
 // ===========================================================================
@@ -190,6 +270,7 @@ bool TriSenseINS::begin(const TriSenseINSConfig &config) {
     }
   }
 
+  if (_cfg.configureSensors) configureImuFilters();
   if (_cfg.calibrateGyro) _sensor.autoCalibrateGyro(_cfg.gyroCalibrationSamples);
 
   return reset();
@@ -199,6 +280,8 @@ bool TriSenseINS::reset() {
   memset(_accSum, 0, sizeof(_accSum));
   memset(_gyrSum, 0, sizeof(_gyrSum));
   _imuCount = 0;
+  resetEpochIntegrals();
+  _havePrevTheta = false;
   memset(&_pending, 0, sizeof(_pending));
   memset(&_meas, 0, sizeof(_meas));
   _droppedEpochs = 0;
@@ -213,7 +296,9 @@ bool TriSenseINS::reset() {
 
   _sensor.imu.flushFIFO();
   const uint64_t now = nowUs();
+  resetImuTiming(now);
   _lastEpochUs = now;
+  _lastEpochMcuUs = now;
   _lastMagUs = now;
   _lastBaroUs = now;
   _lastStarvedUs = now;
@@ -253,6 +338,8 @@ bool TriSenseINS::initFilter() {
   opt.mag_field_tolerance   = _cfg.magFieldTolerance;
   opt.auto_zupt_disable     = !_cfg.autoZupt;
   opt.chi2_disable          = !_cfg.outlierRejection;
+  // Body axis absolute headings refer to (FRD; INSLIB patch 0001).
+  for (int i = 0; i < 3; i++) opt.heading_axis_b[i] = _cfg.headingAxis[i];
   // The magnetometer is calibrated here (setMagCalibration), so INSLIB's own
   // mag_fixed_bias / mag_misalignment stay at zero = identity.
 
@@ -315,6 +402,238 @@ int TriSenseINS::freeStackBytes() {
 
 uint32_t TriSenseINS::getImuLostPackets() const { return _sensor.imu.getLostPacketCount(); }
 
+// Anti-alias / UI filter from the config, where the driver offers them. A
+// value of 0 leaves the respective filter as it is.
+void TriSenseINS::configureImuFilters() {
+  if (_cfg.imuGyroAafHz > 0 || _cfg.imuAccelAafHz > 0) {
+    // The driver call sets both; 0 would DISABLE one, so keep the other as is
+    // by asking for its power-on value only if it was not configured.
+    const uint16_t g = _cfg.imuGyroAafHz > 0 ? _cfg.imuGyroAafHz : 585;
+    const uint16_t a = _cfg.imuAccelAafHz > 0 ? _cfg.imuAccelAafHz : 1163;
+    (void)imuSetAaf(_sensor.imu, g, a, 0);
+  }
+  if (_cfg.imuGyroUiFilterHz > 0.0f || _cfg.imuAccelUiFilterHz > 0.0f) {
+    // Power-on bandwidth: max(400 Hz, ODR) / 4.
+    int odr = _sensor.imu.getODRHz();
+    const float def = (odr > 400 ? (float)odr : 400.0f) / 4.0f;
+    (void)imuSetUi(_sensor.imu, _cfg.imuGyroUiFilterHz > 0.0f ? _cfg.imuGyroUiFilterHz : def,
+                   _cfg.imuAccelUiFilterHz > 0.0f ? _cfg.imuAccelUiFilterHz : def, 0);
+  }
+}
+
+// A new ODR (begin(), or the driver stepped it down): the nominal period
+// changes, the calibrated clock error carries over (same oscillator).
+void TriSenseINS::setOdr(int odr) {
+  if (odr <= 0) odr = 1000;
+  _odrHz = (uint16_t)odr;
+  _samplePeriodNominalS = 1.0 / (double)odr;
+  _samplePeriodS = _samplePeriodNominalS * _clockScale;
+  _tsValid = false;
+  _calWindowClean = false;
+}
+
+// ===========================================================================
+// IMU timing
+// ===========================================================================
+
+void TriSenseINS::resetImuTiming(uint64_t now) {
+  _fifoMode = _sensor.imu.getFIFOMode() != FIFO_NONE;
+  // Packets the 2 KB FIFO holds: 16-byte packets in 16-bit mode, 20-byte in HiRes.
+  _fifoCapacity = (_sensor.imu.getFIFOMode() == FIFO_20BIT_HIRES) ? 102 : 128;
+
+  int odr = _sensor.imu.getODRHz();
+  if (odr <= 0) odr = 1000;
+  _clockScale = 1.0;
+  setOdr(odr);
+
+  if (!_fifoMode) {
+    _imuCap = 1;
+  } else if (_cfg.imuMaxPacketsPerUpdate > 0) {
+    _imuCap = _cfg.imuMaxPacketsPerUpdate;
+  } else {
+    // Four epochs' worth: even if update() runs only once per epoch, it reads
+    // four times faster than the FIFO fills, so a backlog always drains.
+    const uint32_t perEpoch = ((uint32_t)odr + _cfg.navRateHz - 1) / _cfg.navRateHz;
+    uint32_t cap = 4 * perEpoch;
+    if (cap < 32) cap = 32;
+    if (cap > _fifoCapacity) cap = _fifoCapacity;
+    _imuCap = (uint16_t)cap;
+  }
+
+  _sensorTimeNs = now * 1000ULL;
+  _lastDrainUs = now;
+  _backlogAfter = 0;
+  _maxBacklog = 0;
+  _lostPending = 0;
+  _lostAccounted = 0;
+  _lostInferred = 0;
+  _lostTs = 0;
+  _lostOwn = 0;
+  _tsValid = false;
+  _tsSkipGap = false;
+  _epochSampleTimeS = 0;
+  _driverLostBase = _sensor.imu.getLostPacketCount();
+  _lastEpochSamples = 0;
+  _dtMismatch = 0;
+  _lastDt = 0.0f;
+  _calWindowClean = true;
+  _calStartUs = now;
+  _calSamples = 0;
+  _calStartBacklog = 0;
+}
+
+// Read up to _imuCap packets, converting to FRD / SI on the way in, and account
+// for packets the FIFO dropped since the last call.
+void TriSenseINS::drainImu(uint64_t now) {
+  uint32_t avail = 0;
+  if (_fifoMode) {
+    // The driver may change the ODR on its own (stepDownODR()).
+    const int odr = _sensor.imu.getODRHz();
+    if (odr > 0 && odr != _odrHz) setOdr(odr);
+    avail = _sensor.imu.availablePackets();
+    if (avail > _maxBacklog) _maxBacklog = avail;
+    // A full FIFO (Stream mode) discards new samples. What arrived since the
+    // last call should be the elapsed time over the sample period; anything
+    // short of that, while the FIFO is full, was lost. Only trusted when full:
+    // otherwise a shortfall is just the sample clock running slightly slow.
+    if (avail + 2 >= _fifoCapacity) {
+      const double expected = (double)(now - _lastDrainUs) * 1e-6 / _samplePeriodS;
+      const double arrived = (double)avail - (double)_backlogAfter;
+      const double missing = expected - arrived;
+      if (missing > 2.0) {
+        const uint32_t m = (uint32_t)(missing + 0.5);
+        _lostInferred += m;
+        _lostOwn += m;
+        // The timestamp gap these samples leave behind can wrap the 16-bit
+        // counter (65.5 ms) and is already counted here: skip it.
+        _tsSkipGap = true;
+      }
+    }
+  }
+  _lastDrainUs = now;
+
+  float ax, ay, az, gx, gy, gz;
+  uint32_t n = 0;
+  while (n < _imuCap && _sensor.imu.readFIFO(ax, ay, az, gx, gy, gz)) {
+    float a[3], g[3];
+    toFRD(ax * G_MPS2, ay * G_MPS2, az * G_MPS2, a);
+    toFRD(gx * DEG2RADF, gy * DEG2RADF, gz * DEG2RADF, g);
+    // The sensor's own timestamp (1 us of its clock per LSB): a gap of k
+    // sample periods means k - 1 samples are missing - an overflow, or a
+    // packet the driver dropped as invalid, which nothing else would notice.
+    uint16_t ts;
+    if (_fifoMode && imuTimestamp(_sensor.imu, ts, 0)) {
+      if (_tsValid) {
+        const double gap = (double)(uint16_t)(ts - _prevTs) * _odrHz * 1e-6;
+        const uint32_t k = (uint32_t)(gap + 0.5);
+        if (k >= 2) {
+          if (_tsSkipGap) {
+            _tsSkipGap = false;
+          } else {
+            _lostTs += k - 1;
+            _lostOwn += k - 1;
+          }
+        }
+      }
+      _prevTs = ts;
+      _tsValid = true;
+    } else {
+      _tsValid = false;
+    }
+    if (_cfg.perSampleIntegration) integrateSample(a, g);
+    _accSum[0] += a[0]; _accSum[1] += a[1]; _accSum[2] += a[2];
+    _gyrSum[0] += g[0]; _gyrSum[1] += g[1]; _gyrSum[2] += g[2];
+    _imuCount++;
+    _epochSampleTimeS += _samplePeriodS;
+    n++;
+  }
+  if (!_fifoMode) return;
+
+  _backlogAfter = avail > n ? avail - n : 0;
+  _calSamples += n;
+
+  // The driver's count and ours are cumulative and see the same overflows,
+  // so charge only the growth of the larger one: no double counting when they
+  // report the same overflow in different calls.
+  const uint32_t driverLost = _sensor.imu.getLostPacketCount() - _driverLostBase;
+  const uint32_t total = driverLost > _lostOwn ? driverLost : _lostOwn;
+  if (total > _lostAccounted) {
+    // Lost samples were produced too: they count for the clock calibration.
+    _calSamples += total - _lostAccounted;
+    _lostPending += total - _lostAccounted;
+    _lostAccounted = total;
+  }
+}
+
+void TriSenseINS::resetEpochIntegrals() {
+  _dq[0] = 1.0f; _dq[1] = _dq[2] = _dq[3] = 0.0f;
+  _dvb[0] = _dvb[1] = _dvb[2] = 0.0f;
+}
+
+// One IMU sample into the epoch's increments (perSampleIntegration):
+//   delta angle    theta_k = (w_k - b) T, plus the two-sample coning term
+//                  1/12 theta_{k-1} x theta_k (Savage / Bortz), so the sum of
+//                  sample-rate increments follows a rotation axis that moves
+//                  between samples;
+//   attitude       dq <- dq * exp(theta_k)        (body_start <- body_k);
+//   velocity       dv <- dv + R(dq_{k-1}) (f_k T + 1/2 theta_k x f_k T),
+//                  i.e. f_k rotated to the epoch-start frame at mid-sample
+//                  (sculling).
+// The gyro bias the filter currently estimates is taken out first and added
+// back in runEpoch(), so it is not rotated along with the body.
+void TriSenseINS::integrateSample(const float a[3], const float g[3]) {
+  if (_imuCount == 0) {
+    float b[3] = {0.0f, 0.0f, 0.0f};
+    if (!ins_get_bias_gyr(&_suite.ins, b)) ahrs_get_bias_gyr(&_suite.ars, b);
+    memcpy(_intBias, b, sizeof(_intBias));
+  }
+  const float T = (float)_samplePeriodS;  // the sample being added
+  float th[3] = {(g[0] - _intBias[0]) * T, (g[1] - _intBias[1]) * T, (g[2] - _intBias[2]) * T};
+  float rot[3] = {th[0], th[1], th[2]};
+  if (_havePrevTheta) {
+    float c[3];
+    cross3(_prevTheta, th, c);
+    rot[0] += c[0] / 12.0f; rot[1] += c[1] / 12.0f; rot[2] += c[2] / 12.0f;
+  }
+  memcpy(_prevTheta, th, sizeof(_prevTheta));
+  _havePrevTheta = true;
+
+  float dvk[3] = {a[0] * T, a[1] * T, a[2] * T}, c[3];
+  cross3(th, dvk, c);
+  dvk[0] += 0.5f * c[0]; dvk[1] += 0.5f * c[1]; dvk[2] += 0.5f * c[2];
+  float dvs[3];
+  qRotate(_dq, dvk, dvs);
+  _dvb[0] += dvs[0]; _dvb[1] += dvs[1]; _dvb[2] += dvs[2];
+
+  float e[4], qn[4];
+  qExp(rot, e);
+  qMul(_dq, e, qn);
+  const float nrm = 1.0f / sqrtf(qn[0] * qn[0] + qn[1] * qn[1] + qn[2] * qn[2] + qn[3] * qn[3]);
+  for (int i = 0; i < 4; i++) _dq[i] = qn[i] * nrm;
+}
+
+// The sample clock of the IMU against the MCU crystal, over >= 2 s windows
+// without an unexplained dt mismatch or ODR change. Samples read + samples
+// lost + the change in backlog = samples produced.
+void TriSenseINS::calibrateSamplePeriod(uint64_t now) {
+  const uint64_t span = now - _calStartUs;
+  if (span < 2000000ULL) return;
+  const double produced = (double)_calSamples + (double)_backlogAfter - (double)_calStartBacklog;
+  if (_cfg.calibrateImuPeriod && _calWindowClean && produced > 100.0) {
+    double scale = (double)span * 1e-6 / produced / _samplePeriodNominalS;
+    if (scale < 0.95) scale = 0.95;
+    if (scale > 1.05) scale = 1.05;
+    // Fast at first, then a slow average: one window is good to ~1e-4.
+    const double alpha = (_clockScale == 1.0) ? 1.0 : 0.25;
+    _clockScale += alpha * (scale - _clockScale);
+    _samplePeriodS = _samplePeriodNominalS * _clockScale;
+  }
+  _calWindowClean = true;
+  _calStartUs = now;
+  _calSamples = 0;
+  _calStartBacklog = _backlogAfter;
+}
+
 // ===========================================================================
 // The epoch loop
 // ===========================================================================
@@ -322,21 +641,10 @@ uint32_t TriSenseINS::getImuLostPackets() const { return _sensor.imu.getLostPack
 bool TriSenseINS::update() {
   if (!_begun) return false;
 
-  // Drain the IMU FIFO, converting to FRD / SI on the way in. Capped so one
-  // call can never starve the epoch clock; without the FIFO every read is a
-  // fresh register read, so take one per call.
-  const int cap = (_sensor.imu.getFIFOMode() == FIFO_NONE) ? 1 : 64;
-  float ax, ay, az, gx, gy, gz;
-  for (int n = 0; n < cap && _sensor.imu.readFIFO(ax, ay, az, gx, gy, gz); n++) {
-    float a[3], g[3];
-    toFRD(ax * G_MPS2, ay * G_MPS2, az * G_MPS2, a);
-    toFRD(gx * DEG2RADF, gy * DEG2RADF, gz * DEG2RADF, g);
-    _accSum[0] += a[0]; _accSum[1] += a[1]; _accSum[2] += a[2];
-    _gyrSum[0] += g[0]; _gyrSum[1] += g[1]; _gyrSum[2] += g[2];
-    _imuCount++;
-  }
+  drainImu(nowUs());
 
   const uint64_t now = nowUs();
+  if (_fifoMode) calibrateSamplePeriod(now);
   const uint64_t period = 1000000UL / _cfg.navRateHz;
   if (now - _lastEpochUs < period) return false;
 
@@ -350,11 +658,42 @@ bool TriSenseINS::update() {
     return false;
   }
 
-  float dt = (float)(now - _lastEpochUs) * 1e-6f;
-  _lastEpochUs = now;
+  // dt from the sensor: the samples this epoch consumed, plus the ones the
+  // FIFO lost in between (their time passed even though their data is gone;
+  // the batch mean stands in for them), times the sample period. The MCU
+  // clock only serves as a cross-check: it carries loop jitter, and the FIFO
+  // backlog means the samples read now were taken some time ago.
+  const float dtMcu = (float)(now - _lastEpochMcuUs) * 1e-6f;
+  _lastEpochMcuUs = now;
+  float dt = dtMcu;
+  _lastEpochSamples = _imuCount + _lostPending;
+  if (_fifoMode) {
+    const float T = (float)_samplePeriodS;
+    const float dtSamples = (float)(_epochSampleTimeS + (double)_lostPending * _samplePeriodS);
+    dt = dtSamples;
+    if (fabsf(dtSamples - dtMcu) > _cfg.dtMismatchTolerance * dtMcu + T) {
+      _dtMismatch++;
+      _calWindowClean = false;
+      // Fewer samples than time with nothing left in the FIFO and no loss
+      // reported: data went missing unexplained (sensor reset, ODR changed
+      // behind our back). The time really passed - use the MCU clock. Every
+      // other case (backlog being drained, backlog left for the next call) is
+      // explained by the FIFO, and the samples are the truth.
+      if (dtSamples < dtMcu && _backlogAfter == 0) dt = dtMcu;
+    }
+  }
+  _lostPending = 0;
+  // Fixed-step epoch schedule, so navRateHz is the rate actually delivered
+  // and not navRateHz minus the loop's granularity. Resync after a stall
+  // rather than firing a burst of catch-up epochs.
+  _lastEpochUs += period;
+  if (now - _lastEpochUs >= period) _lastEpochUs = now;
   if (dt > 0.25f) dt = 0.25f;  // a stalled loop must not inject a wild step
+  _lastDt = dt;
+  _sensorTimeNs += (uint64_t)((double)dt * 1e9 + 0.5);
 
   runEpoch(now, dt);
+  _epochSampleTimeS = 0;
 
   _epochCount++;
   if (now - _rateWindowUs >= 1000000ULL) {
@@ -369,21 +708,21 @@ void TriSenseINS::runEpoch(uint64_t now, float dt) {
   // Aiding fed since the last epoch (GNSS, speed, heading, ZUPT) rides along.
   memcpy(&_meas, &_pending, sizeof(_meas));
   memset(&_pending, 0, sizeof(_pending));
-  _meas.timestamp = (ins_time_us_t)now;
+  // The filter runs on sensor time (see update()), so the epoch is stamped
+  // with the end of the IMU data it carries, not with micros().
+  _meas.timestamp = (ins_time_us_t)(_sensorTimeNs / 1000ULL);
 
-  // Time spent waiting for this epoch is extra age on top of the stated delay.
-  if (_meas.gnss_pos.is_valid || _meas.gnss_vel.is_valid) {
-    const uint64_t waited = now - _gnssFedUs;
-    _meas.gnss_delay_us = (int32_t)(waited > 500000ULL ? 500000ULL : waited);
-  }
-  if (_meas.speed.is_valid) {
-    const uint64_t waited = now - _speedFedUs;
-    _meas.speed_delay_us = (int32_t)(waited > 500000ULL ? 500000ULL : waited);
-  }
-  if (_meas.yaw.is_valid) {
-    const uint64_t waited = now - _yawFedUs;
-    _meas.yaw_delay_us = (int32_t)(waited > 500000ULL ? 500000ULL : waited);
-  }
+  // Time spent waiting for this epoch is extra age on top of the stated delay,
+  // less the samples still queued in the FIFO (the epoch's data is that old).
+  const uint64_t queuedUs = _fifoMode ? (uint64_t)((double)_backlogAfter * _samplePeriodS * 1e6) : 0;
+  const uint64_t epochUs = now > queuedUs ? now - queuedUs : 0;
+  auto ageSince = [epochUs](uint64_t fedUs) -> int32_t {
+    const uint64_t waited = epochUs > fedUs ? epochUs - fedUs : 0;
+    return (int32_t)(waited > 500000ULL ? 500000ULL : waited);
+  };
+  if (_meas.gnss_pos.is_valid || _meas.gnss_vel.is_valid) _meas.gnss_delay_us = ageSince(_gnssFedUs);
+  if (_meas.speed.is_valid) _meas.speed_delay_us = ageSince(_speedFedUs);
+  if (_meas.yaw.is_valid) _meas.yaw_delay_us = ageSince(_yawFedUs);
 
   // --- IMU: the mean of the batch over the batch's own time. Integrating the
   // mean once over dt is the same first-order strapdown step as integrating
@@ -399,6 +738,32 @@ void TriSenseINS::runEpoch(uint64_t now, float dt) {
     _meas.gyr.Qll_diag[i] = _cfg.gyroNoisePSD;
     _accSum[i] = 0.0f;
     _gyrSum[i] = 0.0f;
+  }
+
+  // --- Per-sample integration: replace the means by the constant rate and
+  // specific force that reproduce the epoch's increments in INSLIB's
+  // strapdown. Its attitude step is exactly exp((w - b) dt), so
+  // w = log(dq) / Tn + b. Its velocity step is R_k (f dt + 1/2 (w x f) dt^2),
+  // so f = (I + K)^-1 dv / Tn with K = dt/2 [w x], whose closed-form inverse
+  // is I - K / (1 + s) + K^2 / (1 + s), s = |dt/2 w|^2. Tn is the time the
+  // samples cover; dt may be longer if samples were lost, and the rate and
+  // force then stand in for the missing time, as the plain means do.
+  if (_cfg.perSampleIntegration) {
+    const float Tn = (float)_epochSampleTimeS;
+    float rv[3], w[3];
+    qLog(_dq, rv);
+    for (int i = 0; i < 3; i++) w[i] = rv[i] / Tn;
+    float gsf[3] = {_dvb[0] / Tn, _dvb[1] / Tn, _dvb[2] / Tn};
+    float k[3] = {0.5f * dt * w[0], 0.5f * dt * w[1], 0.5f * dt * w[2]};
+    const float sn = k[0] * k[0] + k[1] * k[1] + k[2] * k[2];
+    float kg[3], kkg[3];
+    cross3(k, gsf, kg);
+    cross3(k, kg, kkg);
+    for (int i = 0; i < 3; i++) {
+      _meas.gyr.data[i] = w[i] + _intBias[i];
+      _meas.acc.data[i] = gsf[i] + (kkg[i] - kg[i]) / (1.0f + sn);
+    }
+    resetEpochIntegrals();
   }
   _imuCount = 0;
 
@@ -521,7 +886,7 @@ bool TriSenseINS::feedGnss(const TriSenseGnssFix &fix) {
     float c = wrap360(fix.courseDeg);
     if (c > 180.0f) c -= 360.0f;
     _pending.yaw.is_valid = true;
-    _pending.yaw.yaw_rad = c * DEG2RADF;  // NED yaw == course over ground
+    _pending.yaw.yaw_rad = c * DEG2RADF;  // heading of headingAxis == course over ground
     _pending.yaw.stddev_rad = _cfg.gnssCourseSigmaDeg * DEG2RADF;
     _pending.yaw_delay_ms = delayMs;
     _yawFedUs = _gnssFedUs;

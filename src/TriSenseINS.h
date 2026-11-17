@@ -108,6 +108,52 @@ struct TriSenseINSConfig {
   // Kalman filter treats as independent). false: leave the sensors as they are.
   bool    configureSensors = true;
   ICM_ODR imuOdr = ODR_1KHZ;
+
+  // --- IMU timing ---------------------------------------------------------------
+  // Each epoch's dt is the number of IMU samples it consumed (plus samples the
+  // FIFO lost in between) times the IMU sample period - not the micros() gap
+  // between epochs, which carries loop jitter and the FIFO backlog. See
+  // getLastEpochSamples() and friends below.
+  //
+  // Most packets update() reads from the FIFO in one call. 0 = automatic:
+  // 4 epochs' worth of samples (ODR / navRateHz), at least 32, at most the
+  // 128-packet FIFO - enough to drain the FIFO even if update() only ran once
+  // per epoch. Without the FIFO (FIFO_NONE) update() always reads one sample.
+  uint16_t imuMaxPacketsPerUpdate = 0;
+  // If the dt from the sample count and the dt from the MCU clock disagree by
+  // more than this fraction (plus one sample of quantisation), the epoch is
+  // counted in getDtMismatchCount() and the safer of the two is used: the MCU
+  // time when samples went missing unexplained, the sample time when a FIFO
+  // backlog explains the difference.
+  float dtMismatchTolerance = 0.20f;
+  // The ICM-42688's sample clock is an internal oscillator, typically within
+  // a percent or two of nominal; a 1.5 % error is a 1.5 % error in every
+  // integrated angle. true: measure the real sample period against the MCU
+  // crystal (2 s windows, clamped to +-5 %) and integrate with that.
+  bool calibrateImuPeriod = true;
+  // IMU filters (Voltino_TriSense >= the release with setAntiAliasFilter /
+  // setUIFilter; ignored with an older driver). 0 = leave the sensor as it is
+  // (power-on: gyro AAF 585 Hz, accel AAF 1163 Hz, UI filter
+  // max(400 Hz, ODR)/4 2nd order). The anti-alias filter is what keeps motor
+  // and airframe vibration above the output Nyquist (ODR/2) from folding down
+  // into the band the filter integrates; at 1 kHz something like 400 Hz is a
+  // sensible start. Applied by begin() when configureSensors is set; costs
+  // ~80 ms per call (the driver power-cycles the sensors as the datasheet
+  // requires), so it never happens in flight.
+  uint16_t imuGyroAafHz = 0;
+  uint16_t imuAccelAafHz = 0;
+  float    imuGyroUiFilterHz = 0.0f;
+  float    imuAccelUiFilterHz = 0.0f;
+  // false (default): each epoch hands INSLIB the plain mean of its IMU
+  // samples - exact for rotation about a fixed axis, but it drops the coning
+  // (and sculling) motion inside the epoch, which a rocket's vibration and
+  // roll-while-pitching produce. true: every sample's delta angle is
+  // integrated into the epoch's delta quaternion (with the two-sample coning
+  // correction) and its velocity increment into the epoch's start frame
+  // (sculling), and INSLIB gets the constant rate / specific force that
+  // reproduce exactly those increments over the epoch. Costs some 100 float
+  // operations per sample (no trig), a few microseconds per epoch.
+  bool perSampleIntegration = false;
   // Boot-time gyro bias estimate (board must be still). INSLIB keeps
   // estimating the bias afterwards; this only makes the start cleaner.
   bool     calibrateGyro = true;
@@ -156,6 +202,13 @@ struct TriSenseINSConfig {
   bool  gnssUseCourseAsHeading = false;
   float gnssCourseMinSpeedMps  = 3.0f;
   float gnssCourseSigmaDeg     = 8.0f;
+  // Heading axis: the body (FRD) axis whose compass direction feedHeading()
+  // and the course-over-ground heading refer to. The default, FRD x, makes
+  // that the usual yaw. Such a heading is ignored only while THIS axis points
+  // within ~8 deg of straight up or down - not whenever the pitch is near
+  // +-90 deg. E.g. a rocket that stands on its FRD x axis can take a launch
+  // rail azimuth for an axis across the body (FRD y or z) on the pad.
+  float headingAxis[3] = {1.0f, 0.0f, 0.0f};
   // Geoid separation used when feedGnss() is not given one [m]. NMEA altitude
   // is above mean sea level; INSLIB works in ellipsoid height. Czechia ~ +44 m.
   float geoidSeparationM = 44.0f;
@@ -224,7 +277,8 @@ public:
 
   // Scalar speed from odometry (wheel, airspeed is NOT ground speed) [m/s].
   void feedSpeed(float speedMps, float sigmaMps = 0.0f, uint16_t delayMs = 0);
-  // Absolute heading from an external source (dual-antenna GNSS, ...) [deg].
+  // Absolute heading from an external source (dual-antenna GNSS, ...) [deg]:
+  // the compass direction of TriSenseINSConfig::headingAxis (default FRD x).
   void feedHeading(float headingDeg, float sigmaDeg, uint16_t delayMs = 0);
   // "I know the vehicle is not moving" for the next epoch (e.g. on the launch pad).
   void zeroVelocityUpdate();
@@ -334,7 +388,40 @@ public:
   uint32_t getLastUpdateUs() const  { return _navLastUs; }
   uint32_t getMaxUpdateUs() const   { return _navMaxUs; }
   uint32_t getDroppedEpochs() const { return _droppedEpochs; }
+  // Lost IMU packets as the Voltino driver counts them: the sensor's own
+  // FIFO_LOST_PKT counter, accumulated since the driver started (not reset by
+  // begin()/reset()). The driver reads it only when it finds the FIFO full, and
+  // the first such event after boot only sets its baseline - so it can
+  // under-count. getImuLostSamples() is the number TriSenseINS actually uses.
   uint32_t getImuLostPackets() const;
+  // IMU timing since begin()/reset():
+  // samples lost to FIFO overflow, accounted for in the epoch dt (the larger of
+  // the driver's count and what the FIFO fill level and MCU clock imply);
+  uint32_t getImuLostSamples() const   { return _lostAccounted; }
+  // samples (read + lost) that went into the last epoch;
+  uint32_t getLastEpochSamples() const { return _lastEpochSamples; }
+  // most packets ever waiting in the FIFO when update() started draining it
+  // (128 = the FIFO was full, data was being lost);
+  uint32_t getImuMaxBacklog() const    { return _maxBacklog; }
+  // packets still waiting after the last update() (capped by
+  // imuMaxPacketsPerUpdate);
+  uint32_t getImuBacklog() const       { return _backlogAfter; }
+  // epochs whose sample-count dt and MCU-clock dt disagreed (see
+  // TriSenseINSConfig::dtMismatchTolerance);
+  uint32_t getDtMismatchCount() const  { return _dtMismatch; }
+  // the dt [s] handed to the filter in the last epoch;
+  float    getLastEpochDt() const      { return _lastDt; }
+  // the IMU sample period in use [us] (calibrated if calibrateImuPeriod);
+  float    getImuSamplePeriodUs() const { return (float)(_samplePeriodS * 1e6); }
+  // packets read from the FIFO per update() call at most (resolved config);
+  uint16_t getImuMaxPacketsPerUpdate() const { return _imuCap; }
+  // whether the FIFO packets carry the sensor's own timestamps (driver and
+  // sensor support them) - then every gap between two samples is seen, not
+  // only FIFO overflows - and how many lost samples were found that way;
+  bool     imuTimestampsUsed() const       { return _tsValid; }
+  uint32_t getImuTimestampGapSamples() const { return _lostTs; }
+  // the IMU ODR in use [Hz] (follows the driver, e.g. after stepDownODR()).
+  uint16_t getImuOdrHz() const { return _odrHz; }
   // Free stack measured right before the last filter call [bytes], -1 if the
   // platform cannot tell. stackOk() is false once it was ever below
   // TRISENSE_INS_STACK_NEEDED - expect corrupted memory then, see README.
@@ -383,7 +470,45 @@ private:
   float    _gyrSum[3];
   uint32_t _imuCount = 0;
 
-  uint64_t _lastEpochUs = 0;
+  // Per-sample integration (perSampleIntegration), see drainImu().
+  float    _dq[4];        // body at epoch start <- body now
+  float    _dvb[3];       // velocity increment in the epoch-start body frame [m/s]
+  float    _prevTheta[3]; // last sample's delta angle, for the coning term
+  float    _intBias[3];   // gyro bias removed before integrating
+  bool     _havePrevTheta = false;
+
+  // IMU timing (see update()).
+  uint16_t _imuCap = 64;
+  bool     _fifoMode = true;
+  uint16_t _fifoCapacity = 128;    // packets the hardware FIFO holds
+  double   _samplePeriodNominalS = 0.001;
+  double   _samplePeriodS = 0.001;
+  double   _clockScale = 1.0;       // IMU sample clock: true / nominal period
+  uint16_t _odrHz = 1000;
+  double   _epochSampleTimeS = 0;   // time covered by the samples read this epoch
+  uint16_t _prevTs = 0;             // FIFO timestamp of the previous packet
+  bool     _tsValid = false;
+  bool     _tsSkipGap = false;      // the next gap is an overflow already counted
+  uint32_t _lostTs = 0;
+  uint32_t _lostOwn = 0;            // timestamp gaps + overflow inference
+  uint64_t _sensorTimeNs = 0;      // filter time: advances by each epoch's dt
+  uint64_t _lastDrainUs = 0;
+  uint32_t _backlogAfter = 0;
+  uint32_t _maxBacklog = 0;
+  uint32_t _lostPending = 0;       // lost samples not yet charged to an epoch
+  uint32_t _lostAccounted = 0;
+  uint32_t _lostInferred = 0;
+  uint32_t _driverLostBase = 0;
+  uint32_t _lastEpochSamples = 0;
+  uint32_t _dtMismatch = 0;
+  float    _lastDt = 0.0f;
+  bool     _calWindowClean = true;  // no loss / mismatch in the calibration window
+  uint64_t _calStartUs = 0;
+  uint64_t _calSamples = 0;
+  uint32_t _calStartBacklog = 0;
+
+  uint64_t _lastEpochUs = 0;     // epoch schedule (fixed steps of 1/navRateHz)
+  uint64_t _lastEpochMcuUs = 0;  // micros() when the last epoch actually ran
   uint64_t _lastMagUs = 0;
   uint64_t _lastBaroUs = 0;
   uint64_t _lastStarvedUs = 0;
@@ -405,6 +530,13 @@ private:
   void     rebuildMount();
   void     toFRD(float x, float y, float z, float out[3]) const;
   bool     readMagnetometer(float out[3]);
+  void     drainImu(uint64_t nowUs);
+  void     integrateSample(const float a[3], const float g[3]);
+  void     resetEpochIntegrals();
+  void     resetImuTiming(uint64_t nowUs);
+  void     calibrateSamplePeriod(uint64_t nowUs);
+  void     setOdr(int odrHz);
+  void     configureImuFilters();
   void     runEpoch(uint64_t nowUs, float dt);
   float    stateStdDev(int idx) const;
   static int freeStackBytes();
