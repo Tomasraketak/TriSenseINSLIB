@@ -213,7 +213,9 @@ bool TriSenseINS::reset() {
 
   _sensor.imu.flushFIFO();
   const uint64_t now = nowUs();
+  resetImuTiming(now);
   _lastEpochUs = now;
+  _lastEpochMcuUs = now;
   _lastMagUs = now;
   _lastBaroUs = now;
   _lastStarvedUs = now;
@@ -316,27 +318,130 @@ int TriSenseINS::freeStackBytes() {
 uint32_t TriSenseINS::getImuLostPackets() const { return _sensor.imu.getLostPacketCount(); }
 
 // ===========================================================================
-// The epoch loop
+// IMU timing
 // ===========================================================================
 
-bool TriSenseINS::update() {
-  if (!_begun) return false;
+void TriSenseINS::resetImuTiming(uint64_t now) {
+  _fifoMode = _sensor.imu.getFIFOMode() != FIFO_NONE;
+  // Packets the 2 KB FIFO holds: 16-byte packets in 16-bit mode, 20-byte in HiRes.
+  _fifoCapacity = (_sensor.imu.getFIFOMode() == FIFO_20BIT_HIRES) ? 102 : 128;
 
-  // Drain the IMU FIFO, converting to FRD / SI on the way in. Capped so one
-  // call can never starve the epoch clock; without the FIFO every read is a
-  // fresh register read, so take one per call.
-  const int cap = (_sensor.imu.getFIFOMode() == FIFO_NONE) ? 1 : 64;
+  int odr = _sensor.imu.getODRHz();
+  if (odr <= 0) odr = 1000;
+  _samplePeriodNominalS = 1.0 / (double)odr;
+  _samplePeriodS = _samplePeriodNominalS;
+
+  if (!_fifoMode) {
+    _imuCap = 1;
+  } else if (_cfg.imuMaxPacketsPerUpdate > 0) {
+    _imuCap = _cfg.imuMaxPacketsPerUpdate;
+  } else {
+    // Four epochs' worth: even if update() runs only once per epoch, it reads
+    // four times faster than the FIFO fills, so a backlog always drains.
+    const uint32_t perEpoch = ((uint32_t)odr + _cfg.navRateHz - 1) / _cfg.navRateHz;
+    uint32_t cap = 4 * perEpoch;
+    if (cap < 32) cap = 32;
+    if (cap > _fifoCapacity) cap = _fifoCapacity;
+    _imuCap = (uint16_t)cap;
+  }
+
+  _sensorTimeNs = now * 1000ULL;
+  _lastDrainUs = now;
+  _backlogAfter = 0;
+  _maxBacklog = 0;
+  _lostPending = 0;
+  _lostAccounted = 0;
+  _lostInferred = 0;
+  _driverLostBase = _sensor.imu.getLostPacketCount();
+  _lastEpochSamples = 0;
+  _dtMismatch = 0;
+  _lastDt = 0.0f;
+  _calWindowClean = true;
+  _calStartUs = now;
+  _calSamples = 0;
+  _calStartBacklog = 0;
+}
+
+// Read up to _imuCap packets, converting to FRD / SI on the way in, and account
+// for packets the FIFO dropped since the last call.
+void TriSenseINS::drainImu(uint64_t now) {
+  uint32_t avail = 0;
+  if (_fifoMode) {
+    avail = _sensor.imu.availablePackets();
+    if (avail > _maxBacklog) _maxBacklog = avail;
+    // A full FIFO (Stream mode) discards new samples. What arrived since the
+    // last call should be the elapsed time over the sample period; anything
+    // short of that, while the FIFO is full, was lost. Only trusted when full:
+    // otherwise a shortfall is just the sample clock running slightly slow.
+    if (avail + 2 >= _fifoCapacity) {
+      const double expected = (double)(now - _lastDrainUs) * 1e-6 / _samplePeriodS;
+      const double arrived = (double)avail - (double)_backlogAfter;
+      const double missing = expected - arrived;
+      if (missing > 2.0) _lostInferred += (uint32_t)(missing + 0.5);
+    }
+  }
+  _lastDrainUs = now;
+
   float ax, ay, az, gx, gy, gz;
-  for (int n = 0; n < cap && _sensor.imu.readFIFO(ax, ay, az, gx, gy, gz); n++) {
+  uint32_t n = 0;
+  while (n < _imuCap && _sensor.imu.readFIFO(ax, ay, az, gx, gy, gz)) {
     float a[3], g[3];
     toFRD(ax * G_MPS2, ay * G_MPS2, az * G_MPS2, a);
     toFRD(gx * DEG2RADF, gy * DEG2RADF, gz * DEG2RADF, g);
     _accSum[0] += a[0]; _accSum[1] += a[1]; _accSum[2] += a[2];
     _gyrSum[0] += g[0]; _gyrSum[1] += g[1]; _gyrSum[2] += g[2];
     _imuCount++;
+    n++;
   }
+  if (!_fifoMode) return;
+
+  _backlogAfter = avail > n ? avail - n : 0;
+  _calSamples += n;
+
+  // Both counts are cumulative and see the same packets, so charge only the
+  // growth of the larger one: no double counting when they report the same
+  // overflow in different calls.
+  const uint32_t driverLost = _sensor.imu.getLostPacketCount() - _driverLostBase;
+  const uint32_t total = driverLost > _lostInferred ? driverLost : _lostInferred;
+  if (total > _lostAccounted) {
+    _lostPending += total - _lostAccounted;
+    _lostAccounted = total;
+    _calWindowClean = false;
+  }
+}
+
+// The sample clock of the IMU against the MCU crystal, over >= 2 s windows
+// without data loss. Samples read + the change in backlog = samples produced.
+void TriSenseINS::calibrateSamplePeriod(uint64_t now) {
+  const uint64_t span = now - _calStartUs;
+  if (span < 2000000ULL) return;
+  const double produced = (double)_calSamples + (double)_backlogAfter - (double)_calStartBacklog;
+  if (_cfg.calibrateImuPeriod && _calWindowClean && produced > 100.0) {
+    double measured = (double)span * 1e-6 / produced;
+    const double lo = _samplePeriodNominalS * 0.95, hi = _samplePeriodNominalS * 1.05;
+    if (measured < lo) measured = lo;
+    if (measured > hi) measured = hi;
+    // Fast at first, then a slow average: one window is good to ~1e-4.
+    const double alpha = (_samplePeriodS == _samplePeriodNominalS) ? 1.0 : 0.25;
+    _samplePeriodS += alpha * (measured - _samplePeriodS);
+  }
+  _calWindowClean = true;
+  _calStartUs = now;
+  _calSamples = 0;
+  _calStartBacklog = _backlogAfter;
+}
+
+// ===========================================================================
+// The epoch loop
+// ===========================================================================
+
+bool TriSenseINS::update() {
+  if (!_begun) return false;
+
+  drainImu(nowUs());
 
   const uint64_t now = nowUs();
+  if (_fifoMode) calibrateSamplePeriod(now);
   const uint64_t period = 1000000UL / _cfg.navRateHz;
   if (now - _lastEpochUs < period) return false;
 
@@ -350,9 +455,39 @@ bool TriSenseINS::update() {
     return false;
   }
 
-  float dt = (float)(now - _lastEpochUs) * 1e-6f;
-  _lastEpochUs = now;
+  // dt from the sensor: the samples this epoch consumed, plus the ones the
+  // FIFO lost in between (their time passed even though their data is gone;
+  // the batch mean stands in for them), times the sample period. The MCU
+  // clock only serves as a cross-check: it carries loop jitter, and the FIFO
+  // backlog means the samples read now were taken some time ago.
+  const float dtMcu = (float)(now - _lastEpochMcuUs) * 1e-6f;
+  _lastEpochMcuUs = now;
+  float dt = dtMcu;
+  _lastEpochSamples = _imuCount + _lostPending;
+  if (_fifoMode) {
+    const float T = (float)_samplePeriodS;
+    const float dtSamples = (float)_lastEpochSamples * T;
+    dt = dtSamples;
+    if (fabsf(dtSamples - dtMcu) > _cfg.dtMismatchTolerance * dtMcu + T) {
+      _dtMismatch++;
+      _calWindowClean = false;
+      // Fewer samples than time with nothing left in the FIFO and no loss
+      // reported: data went missing unexplained (sensor reset, ODR changed
+      // behind our back). The time really passed - use the MCU clock. Every
+      // other case (backlog being drained, backlog left for the next call) is
+      // explained by the FIFO, and the samples are the truth.
+      if (dtSamples < dtMcu && _backlogAfter == 0) dt = dtMcu;
+    }
+  }
+  _lostPending = 0;
+  // Fixed-step epoch schedule, so navRateHz is the rate actually delivered
+  // and not navRateHz minus the loop's granularity. Resync after a stall
+  // rather than firing a burst of catch-up epochs.
+  _lastEpochUs += period;
+  if (now - _lastEpochUs >= period) _lastEpochUs = now;
   if (dt > 0.25f) dt = 0.25f;  // a stalled loop must not inject a wild step
+  _lastDt = dt;
+  _sensorTimeNs += (uint64_t)((double)dt * 1e9 + 0.5);
 
   runEpoch(now, dt);
 
@@ -369,21 +504,21 @@ void TriSenseINS::runEpoch(uint64_t now, float dt) {
   // Aiding fed since the last epoch (GNSS, speed, heading, ZUPT) rides along.
   memcpy(&_meas, &_pending, sizeof(_meas));
   memset(&_pending, 0, sizeof(_pending));
-  _meas.timestamp = (ins_time_us_t)now;
+  // The filter runs on sensor time (see update()), so the epoch is stamped
+  // with the end of the IMU data it carries, not with micros().
+  _meas.timestamp = (ins_time_us_t)(_sensorTimeNs / 1000ULL);
 
-  // Time spent waiting for this epoch is extra age on top of the stated delay.
-  if (_meas.gnss_pos.is_valid || _meas.gnss_vel.is_valid) {
-    const uint64_t waited = now - _gnssFedUs;
-    _meas.gnss_delay_us = (int32_t)(waited > 500000ULL ? 500000ULL : waited);
-  }
-  if (_meas.speed.is_valid) {
-    const uint64_t waited = now - _speedFedUs;
-    _meas.speed_delay_us = (int32_t)(waited > 500000ULL ? 500000ULL : waited);
-  }
-  if (_meas.yaw.is_valid) {
-    const uint64_t waited = now - _yawFedUs;
-    _meas.yaw_delay_us = (int32_t)(waited > 500000ULL ? 500000ULL : waited);
-  }
+  // Time spent waiting for this epoch is extra age on top of the stated delay,
+  // less the samples still queued in the FIFO (the epoch's data is that old).
+  const uint64_t queuedUs = _fifoMode ? (uint64_t)((double)_backlogAfter * _samplePeriodS * 1e6) : 0;
+  const uint64_t epochUs = now > queuedUs ? now - queuedUs : 0;
+  auto ageSince = [epochUs](uint64_t fedUs) -> int32_t {
+    const uint64_t waited = epochUs > fedUs ? epochUs - fedUs : 0;
+    return (int32_t)(waited > 500000ULL ? 500000ULL : waited);
+  };
+  if (_meas.gnss_pos.is_valid || _meas.gnss_vel.is_valid) _meas.gnss_delay_us = ageSince(_gnssFedUs);
+  if (_meas.speed.is_valid) _meas.speed_delay_us = ageSince(_speedFedUs);
+  if (_meas.yaw.is_valid) _meas.yaw_delay_us = ageSince(_yawFedUs);
 
   // --- IMU: the mean of the batch over the batch's own time. Integrating the
   // mean once over dt is the same first-order strapdown step as integrating

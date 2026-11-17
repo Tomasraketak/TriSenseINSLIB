@@ -66,6 +66,54 @@ static void run(TriSenseINS &ins, float seconds) {
   }
 }
 
+static void runLoop(TriSenseINS &ins, float seconds, uint32_t loopUs) {
+  const uint64_t end = g_sim_us + (uint64_t)(seconds * 1e6f);
+  while (g_sim_us < end) {
+    g_sim_us += loopUs;
+    ins.update();
+  }
+}
+
+// Angle of the rotation between an estimated and a true body->NED matrix [deg].
+static float rotErrDeg(const float A[3][3], const float B[3][3]) {
+  float tr = 0;
+  for (int i = 0; i < 3; i++)
+    for (int k = 0; k < 3; k++) tr += A[k][i] * B[k][i];
+  float c = 0.5f * (tr - 1.0f);
+  if (c > 1.0f) c = 1.0f;
+  if (c < -1.0f) c = -1.0f;
+  return acosf(c) / D2R;
+}
+
+static float insErrDeg(const TriSenseINS &ins, float rollDeg, float pitchDeg, float yawDeg) {
+  float R[3][3], T[3][3];
+  if (!ins.getRotationMatrix(R)) return 999.0f;
+  eul(rollDeg * D2R, pitchDeg * D2R, yawDeg * D2R, T);
+  return rotErrDeg(R, T);
+}
+
+// Level board turning about the vertical at g_yawRate [deg/s] from g_motionT0.
+static double g_motionT0 = 1e30, g_motionT1 = 1e30;
+static float g_yawRate = 0.0f;
+static float yawAt(double t) {
+  if (t <= g_motionT0) return 0.0f;
+  if (t >= g_motionT1) return (float)(g_yawRate * (g_motionT1 - g_motionT0));
+  return (float)(g_yawRate * (t - g_motionT0));
+}
+static void truthYawRate(double t) {
+  setTruth(0, 0, yawAt(t), 0, ZERO3, ZERO3);
+  const bool turning = t > g_motionT0 && t < g_motionT1;
+  g_truth.gyr[2] = turning ? -g_yawRate : 0.0f;  // FRD z = -sensor z
+}
+
+static TriSenseINSConfig timingConfig() {
+  TriSenseINSConfig c;
+  c.navRateHz = 240;
+  c.useMagnetometer = false;  // attitude from the ARS: yaw is pure gyro integration
+  c.autoZupt = false;
+  return c;
+}
+
 static float angDiff(float a, float b) {
   float d = fmodf(a - b + 540.0f, 360.0f) - 180.0f;
   return fabsf(d);
@@ -243,6 +291,108 @@ int main() {
   }
 
   g_truth.vib = 1.0f;
+
+  // -------------------------------------------------------------------------
+  printf("7) IMU timing at navRateHz 240, ODR 1 kHz, loop 4 kHz\n");
+  {
+    TriSenseINS ins(sensor);
+    setTruth(0, 0, 0, 0, ZERO3, ZERO3);
+    CHECK(ins.begin(timingConfig()), "begin()");
+    runLoop(ins, 10, 250);
+    CHECK(ins.getImuMaxPacketsPerUpdate() == 32, "auto packet cap %u (4 x ceil(1000/240) = 20 -> min 32)",
+          (unsigned)ins.getImuMaxPacketsPerUpdate());
+    CHECK(ins.getEpochRateHz() >= 238 && ins.getEpochRateHz() <= 242, "epoch rate %u Hz", (unsigned)ins.getEpochRateHz());
+    CHECK(ins.getLastEpochSamples() == 4 || ins.getLastEpochSamples() == 5, "last epoch %u samples (4..5)",
+          (unsigned)ins.getLastEpochSamples());
+    CHECK(fabsf(ins.getLastEpochDt() - ins.getLastEpochSamples() * 0.001f) < 2e-5f, "dt %.5f s = samples x 1 ms",
+          ins.getLastEpochDt());
+    CHECK(ins.getDtMismatchCount() == 0, "no sample/MCU dt mismatch (%u)", (unsigned)ins.getDtMismatchCount());
+    CHECK(ins.getImuLostSamples() == 0 && ins.getImuMaxBacklog() <= 2, "lost %u, max FIFO backlog %u",
+          (unsigned)ins.getImuLostSamples(), (unsigned)ins.getImuMaxBacklog());
+    CHECK(fabsf(ins.getImuSamplePeriodUs() - 1000.0f) < 0.5f, "sample period %.2f us", ins.getImuSamplePeriodUs());
+  }
+
+  // -------------------------------------------------------------------------
+  printf("8) IMU sample clock 1.5 %% fast: 10 s at 90 deg/s, yaw from the gyro only\n");
+  {
+    for (int cal = 1; cal >= 0; cal--) {
+      TriSenseINS ins(sensor);
+      sensor.imu.odrHz = 1015.0;  // reports 1000 Hz, really runs at 1015 Hz
+      g_yawRate = 90.0f;
+      g_truth.truthFn = truthYawRate;
+      TriSenseINSConfig c = timingConfig();
+      c.calibrateImuPeriod = cal;
+      g_motionT0 = 1e30;
+      CHECK(ins.begin(c), "begin()");
+      runLoop(ins, 8, 250);
+      g_motionT0 = g_sim_us * 1e-6;
+      g_motionT1 = g_motionT0 + 10.0;
+      runLoop(ins, 11, 250);
+      const float err = insErrDeg(ins, 0, 0, yawAt(g_sim_us * 1e-6));
+      if (cal) {
+        CHECK(fabsf(ins.getImuSamplePeriodUs() - 1e6f / 1015.0f) < 0.5f, "calibrated period %.2f us (true %.2f)",
+              ins.getImuSamplePeriodUs(), 1e6f / 1015.0f);
+        CHECK(err < 1.0f, "attitude error %.2f deg after 900 deg of turn (calibrated)", err);
+      } else {
+        CHECK(err > 5.0f, "without calibration the error is %.1f deg (expect ~13.5) - the test is sensitive", err);
+      }
+      g_truth.truthFn = nullptr;
+      g_motionT0 = g_motionT1 = 1e30;
+      sensor.imu.odrHz = 1000.0;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  printf("9) 200 ms loop stall while turning at 90 deg/s: FIFO overflow\n");
+  {
+    TriSenseINS ins(sensor);
+    g_yawRate = 90.0f;
+    g_truth.truthFn = truthYawRate;
+    CHECK(ins.begin(timingConfig()), "begin()");
+    runLoop(ins, 5, 250);
+    g_motionT0 = g_sim_us * 1e-6;
+    g_motionT1 = g_motionT0 + 1.5;  // the turn ends during the recovery below
+    runLoop(ins, 1, 250);
+    const uint32_t driverBefore = ins.getImuLostPackets();
+    g_sim_us += 200000;  // loop() blocked (SD card, radio, ...)
+    runLoop(ins, 1, 250);
+    const uint32_t lost = ins.getImuLostSamples();
+    printf("  info: driver count +%u (first overflow after boot only primes it), TriSenseINS %u, "
+           "mismatch epochs %u, max backlog %u\n", (unsigned)(ins.getImuLostPackets() - driverBefore),
+           (unsigned)lost, (unsigned)ins.getDtMismatchCount(), (unsigned)ins.getImuMaxBacklog());
+    CHECK(lost >= 69 && lost <= 75, "lost samples %u (expect 200 - 128 = 72)", (unsigned)lost);
+    CHECK(ins.getImuMaxBacklog() >= 126, "max FIFO backlog %u (full)", (unsigned)ins.getImuMaxBacklog());
+    CHECK(ins.getImuBacklog() <= 2, "backlog drained again (%u)", (unsigned)ins.getImuBacklog());
+    const float err = insErrDeg(ins, 0, 0, yawAt(g_sim_us * 1e-6));
+    CHECK(err < 1.0f, "attitude error %.2f deg after the stall (lost time integrated at the batch mean)", err);
+    g_truth.truthFn = nullptr;
+    g_motionT0 = g_motionT1 = 1e30;
+  }
+
+  // -------------------------------------------------------------------------
+  printf("10) Packet cap: slow loop (100 Hz) with the automatic and a too-small cap\n");
+  {
+    for (int pass = 0; pass < 2; pass++) {
+      TriSenseINS ins(sensor);
+      setTruth(0, 0, 0, 0, ZERO3, ZERO3);
+      TriSenseINSConfig c = timingConfig();
+      c.imuMaxPacketsPerUpdate = pass == 0 ? 0 : 4;
+      CHECK(ins.begin(c), "begin() cap %u", (unsigned)ins.getImuMaxPacketsPerUpdate());
+      runLoop(ins, 5, 10000);
+      if (pass == 0) {
+        CHECK(ins.getImuLostSamples() == 0 && ins.getImuBacklog() <= 12,
+              "automatic cap keeps up: lost %u, backlog %u", (unsigned)ins.getImuLostSamples(),
+              (unsigned)ins.getImuBacklog());
+      } else {
+        CHECK(ins.getImuLostSamples() > 1000 && ins.getImuMaxBacklog() >= 126,
+              "cap 4 at 100 Hz cannot keep up: lost %u counted, backlog %u", (unsigned)ins.getImuLostSamples(),
+              (unsigned)ins.getImuMaxBacklog());
+      }
+      float r, p, y;
+      CHECK(ins.getRPY(r, p, y) && fabsf(r) < 1.0f && fabsf(p) < 1.0f, "still level: roll %.2f pitch %.2f", r, p);
+    }
+  }
+
   printf(failures ?"\n%d check(s) FAILED\n" : "\nall checks passed\n", failures);
   return failures ? 1 : 0;
 }

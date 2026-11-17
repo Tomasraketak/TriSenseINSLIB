@@ -108,6 +108,29 @@ struct TriSenseINSConfig {
   // Kalman filter treats as independent). false: leave the sensors as they are.
   bool    configureSensors = true;
   ICM_ODR imuOdr = ODR_1KHZ;
+
+  // --- IMU timing ---------------------------------------------------------------
+  // Each epoch's dt is the number of IMU samples it consumed (plus samples the
+  // FIFO lost in between) times the IMU sample period - not the micros() gap
+  // between epochs, which carries loop jitter and the FIFO backlog. See
+  // getLastEpochSamples() and friends below.
+  //
+  // Most packets update() reads from the FIFO in one call. 0 = automatic:
+  // 4 epochs' worth of samples (ODR / navRateHz), at least 32, at most the
+  // 128-packet FIFO - enough to drain the FIFO even if update() only ran once
+  // per epoch. Without the FIFO (FIFO_NONE) update() always reads one sample.
+  uint16_t imuMaxPacketsPerUpdate = 0;
+  // If the dt from the sample count and the dt from the MCU clock disagree by
+  // more than this fraction (plus one sample of quantisation), the epoch is
+  // counted in getDtMismatchCount() and the safer of the two is used: the MCU
+  // time when samples went missing unexplained, the sample time when a FIFO
+  // backlog explains the difference.
+  float dtMismatchTolerance = 0.20f;
+  // The ICM-42688's sample clock is an internal oscillator, typically within
+  // a percent or two of nominal; a 1.5 % error is a 1.5 % error in every
+  // integrated angle. true: measure the real sample period against the MCU
+  // crystal (2 s windows, clamped to +-5 %) and integrate with that.
+  bool calibrateImuPeriod = true;
   // Boot-time gyro bias estimate (board must be still). INSLIB keeps
   // estimating the bias afterwards; this only makes the start cleaner.
   bool     calibrateGyro = true;
@@ -334,7 +357,33 @@ public:
   uint32_t getLastUpdateUs() const  { return _navLastUs; }
   uint32_t getMaxUpdateUs() const   { return _navMaxUs; }
   uint32_t getDroppedEpochs() const { return _droppedEpochs; }
+  // Lost IMU packets as the Voltino driver counts them: the sensor's own
+  // FIFO_LOST_PKT counter, accumulated since the driver started (not reset by
+  // begin()/reset()). The driver reads it only when it finds the FIFO full, and
+  // the first such event after boot only sets its baseline - so it can
+  // under-count. getImuLostSamples() is the number TriSenseINS actually uses.
   uint32_t getImuLostPackets() const;
+  // IMU timing since begin()/reset():
+  // samples lost to FIFO overflow, accounted for in the epoch dt (the larger of
+  // the driver's count and what the FIFO fill level and MCU clock imply);
+  uint32_t getImuLostSamples() const   { return _lostAccounted; }
+  // samples (read + lost) that went into the last epoch;
+  uint32_t getLastEpochSamples() const { return _lastEpochSamples; }
+  // most packets ever waiting in the FIFO when update() started draining it
+  // (128 = the FIFO was full, data was being lost);
+  uint32_t getImuMaxBacklog() const    { return _maxBacklog; }
+  // packets still waiting after the last update() (capped by
+  // imuMaxPacketsPerUpdate);
+  uint32_t getImuBacklog() const       { return _backlogAfter; }
+  // epochs whose sample-count dt and MCU-clock dt disagreed (see
+  // TriSenseINSConfig::dtMismatchTolerance);
+  uint32_t getDtMismatchCount() const  { return _dtMismatch; }
+  // the dt [s] handed to the filter in the last epoch;
+  float    getLastEpochDt() const      { return _lastDt; }
+  // the IMU sample period in use [us] (calibrated if calibrateImuPeriod);
+  float    getImuSamplePeriodUs() const { return (float)(_samplePeriodS * 1e6); }
+  // packets read from the FIFO per update() call at most (resolved config).
+  uint16_t getImuMaxPacketsPerUpdate() const { return _imuCap; }
   // Free stack measured right before the last filter call [bytes], -1 if the
   // platform cannot tell. stackOk() is false once it was ever below
   // TRISENSE_INS_STACK_NEEDED - expect corrupted memory then, see README.
@@ -383,7 +432,30 @@ private:
   float    _gyrSum[3];
   uint32_t _imuCount = 0;
 
-  uint64_t _lastEpochUs = 0;
+  // IMU timing (see update()).
+  uint16_t _imuCap = 64;
+  bool     _fifoMode = true;
+  uint16_t _fifoCapacity = 128;    // packets the hardware FIFO holds
+  double   _samplePeriodNominalS = 0.001;
+  double   _samplePeriodS = 0.001;
+  uint64_t _sensorTimeNs = 0;      // filter time: advances by each epoch's dt
+  uint64_t _lastDrainUs = 0;
+  uint32_t _backlogAfter = 0;
+  uint32_t _maxBacklog = 0;
+  uint32_t _lostPending = 0;       // lost samples not yet charged to an epoch
+  uint32_t _lostAccounted = 0;
+  uint32_t _lostInferred = 0;
+  uint32_t _driverLostBase = 0;
+  uint32_t _lastEpochSamples = 0;
+  uint32_t _dtMismatch = 0;
+  float    _lastDt = 0.0f;
+  bool     _calWindowClean = true;  // no loss / mismatch in the calibration window
+  uint64_t _calStartUs = 0;
+  uint64_t _calSamples = 0;
+  uint32_t _calStartBacklog = 0;
+
+  uint64_t _lastEpochUs = 0;     // epoch schedule (fixed steps of 1/navRateHz)
+  uint64_t _lastEpochMcuUs = 0;  // micros() when the last epoch actually ran
   uint64_t _lastMagUs = 0;
   uint64_t _lastBaroUs = 0;
   uint64_t _lastStarvedUs = 0;
@@ -405,6 +477,9 @@ private:
   void     rebuildMount();
   void     toFRD(float x, float y, float z, float out[3]) const;
   bool     readMagnetometer(float out[3]);
+  void     drainImu(uint64_t nowUs);
+  void     resetImuTiming(uint64_t nowUs);
+  void     calibrateSamplePeriod(uint64_t nowUs);
   void     runEpoch(uint64_t nowUs, float dt);
   float    stateStdDev(int idx) const;
   static int freeStackBytes();

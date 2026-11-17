@@ -106,7 +106,7 @@ Heights and vertical speeds are **positive up**. Every getter returns `false`
 | Call | |
 |---|---|
 | `begin()` / `begin(TriSenseINSConfig)` | After `sensor.beginAll()`. Sets IMU 1 kHz + FIFO, baro 50 Hz / OSR x8 / no IIR, calibrates the gyro, starts the filter |
-| `update()` | Call from `loop()` as often as possible. Drains the IMU FIFO, polls mag + baro, runs a filter epoch at 200 Hz. `true` when an epoch ran |
+| `update()` | Call from `loop()` as often as possible. Drains the IMU FIFO (at most `imuMaxPacketsPerUpdate` packets per call), polls mag + baro, runs a filter epoch at `navRateHz` (200 Hz). The epoch's dt is the number of IMU samples it consumed (plus any the FIFO lost) times the calibrated sample period, cross-checked against `micros()`. `true` when an epoch ran |
 | `reset()` | Restart the filter, keep calibration and settings |
 | `feedGnss(lat, lon, altMSL, hdop, sats, speed, course, ageMs, geoidSep)` | A GNSS fix (e.g. TinyGPSPlus). HDOP → covariance, latency compensated |
 | `feedGnss(TriSenseGnssFix)` | Same, with optional receiver accuracies and full NED velocity (u-blox UBX) |
@@ -131,7 +131,8 @@ Heights and vertical speeds are **positive up**. Every getter returns `false`
 | Height | `getBaroAltitude(h, vz)`, `getHeight`, `getVerticalSpeed`, `getHeightEllipsoid`, `getHeightMSL`, `getPressureAltitude` |
 | Sensor errors | `getAccelBias`, `getGyroBias`, `getAccelBiasStdDev`, `getGyroBiasStdDev` |
 | Status | `getMode()` → `None` / `AttitudeOnly` / `Coasting` / `Full`, `modeName()`, `isReady`, `hasAttitude`, `hasPosition`, `isZuptActive`, `isVerticalZuptActive`, `getDeadReckoningMs` |
-| Health | `getEpochRateHz`, `getLastUpdateUs`, `getMaxUpdateUs`, `getDroppedEpochs`, `getImuLostPackets`, `getFreeStack`, `stackOk` |
+| Health | `getEpochRateHz`, `getLastUpdateUs`, `getMaxUpdateUs`, `getDroppedEpochs`, `getImuLostPackets` (driver count), `getFreeStack`, `stackOk` |
+| IMU timing | `getImuLostSamples` (lost samples charged to dt), `getLastEpochSamples`, `getLastEpochDt`, `getImuBacklog`, `getImuMaxBacklog`, `getDtMismatchCount`, `getImuSamplePeriodUs`, `getImuMaxPacketsPerUpdate` |
 | Raw | `diagnostics()` (INSLIB `ins_diag_t`), `suite()` (the INSLIB `nav_suite_t`), `lastMeasurements()`, `config()` |
 
 Everything in `TriSenseINSConfig` has a working default; see the comments in
@@ -268,7 +269,10 @@ build the examples and update the version in this README and in
 simulated TriSense and checks the outputs against the simulated truth: level
 and tilted attitude, magnetic vs. true heading, upside-down mounting, hard-iron
 calibration, a 1 g vertical boost tracked by the barometric channel, a static
-GNSS solution and a vehicle accelerating with GNSS.
+GNSS solution and a vehicle accelerating with GNSS. The simulated IMU has the
+real 128-packet FIFO, so the tests also cover the epoch timing: sample-count dt,
+an IMU sample clock 1.5 % off nominal, a 200 ms loop stall that overflows the
+FIFO, and the per-call packet cap.
 
 ```sh
 make -C tests/host

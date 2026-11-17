@@ -11,25 +11,93 @@ enum BMP580_IIR { BMP580_IIR_OFF = 0 };
 enum BMP580_Mode { BMP580_MODE_STANDBY = 0, BMP580_MODE_NORMAL = 1 };
 
 // Truth, written by the test: sensor-frame accel [g], gyro [dps], mag [uT],
-// pressure [Pa].
-struct SimTruth { float acc[3], gyr[3], mag[3], pressure; float vib = 1.0f; };
+// pressure [Pa]. If truthFn is set, the simulated sensors call it with the
+// sample time [s] before producing each sample, so a test can script motion
+// that changes faster than the loop runs (coning, flips).
+struct SimTruth {
+  float acc[3], gyr[3], mag[3], pressure;
+  float vib = 1.0f;
+  void (*truthFn)(double tSec) = nullptr;
+  float gyrNoiseDps = 0.05f;   // per-sample 1-sigma
+  float accNoiseG = 0.002f;
+};
 extern SimTruth g_truth;
 float sim_noise(float sigma);
 
+// ICM-42688-P with its 2 KB FIFO in 16-bit mode: 128 packets, Stream mode
+// (a full FIFO discards NEW samples and counts them in FIFO_LOST_PKT). The
+// lost-packet counter is reported the way the real Voltino driver does it:
+// accumulated only on refills that find the FIFO full, and the first such
+// refill after boot only primes the baseline (its losses are not counted).
 struct SimIMU {
+  static const int CAP = 128;
   ICM_FIFO_MODE mode = FIFO_16BIT;
-  uint64_t nextUs = 0;
+  double odrHz = 1000.0;     // true sample rate (tests can detune it)
+  int    reportedOdrHz = 1000;
+  uint64_t nextNs = 0;       // time of the next sample to be produced
+  struct Pkt { float a[3], g[3]; } q[CAP];
+  int head = 0, count = 0;
+  uint32_t chipLost = 0;      // the chip's own counter (since flush)
+  uint32_t driverLost = 0;    // what getLostPacketCount() reports
+  uint32_t chipLostSeen = 0;
+  bool primed = false;
+  uint64_t produced = 0;
+
   void setODR(ICM_ODR) {}
+  int getODRHz() { return reportedOdrHz; }
   void setFIFOMode(ICM_FIFO_MODE m) { mode = m; }
   ICM_FIFO_MODE getFIFOMode() { return mode; }
-  void flushFIFO() { nextUs = g_sim_us; }
-  uint32_t getLostPacketCount() { return 0; }
-  // One sample per simulated millisecond (1 kHz ODR).
+  void flushFIFO() { produce(); count = 0; head = 0; chipLost = 0; chipLostSeen = 0; }
+  uint32_t getLostPacketCount() { return driverLost; }
+
+  void sample(Pkt &p, double t) {
+    if (g_truth.truthFn) g_truth.truthFn(t);
+    for (int i = 0; i < 3; i++) {
+      p.a[i] = g_truth.acc[i] + sim_noise(g_truth.accNoiseG * g_truth.vib);
+      p.g[i] = g_truth.gyr[i] + sim_noise(g_truth.gyrNoiseDps * g_truth.vib);
+    }
+  }
+  void produce() {
+    const uint64_t nowNs = g_sim_us * 1000ULL;
+    if (nextNs == 0) nextNs = nowNs;
+    const double stepNs = 1e9 / odrHz;
+    while (nextNs <= nowNs) {
+      if (count < CAP) {
+        sample(q[(head + count) % CAP], nextNs * 1e-9);
+        count++;
+      } else {
+        chipLost++;
+      }
+      produced++;
+      nextNs = (uint64_t)((double)nextNs + stepNs + 0.5);
+    }
+  }
+  // Driver refill: reads the lost counter only when the FIFO is (nearly) full.
+  void refillCheck() {
+    if (count + 2 >= CAP) {
+      if (!primed) primed = true;
+      else driverLost += chipLost - chipLostSeen;
+      chipLostSeen = chipLost;
+    }
+  }
+  uint16_t availablePackets() {
+    if (mode == FIFO_NONE) return 1;
+    produce();
+    return (uint16_t)count;
+  }
   bool readFIFO(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
-    if (nextUs > g_sim_us) return false;
-    nextUs += 1000;
-    ax = g_truth.acc[0] + sim_noise(0.002f * g_truth.vib); ay = g_truth.acc[1] + sim_noise(0.002f * g_truth.vib); az = g_truth.acc[2] + sim_noise(0.002f * g_truth.vib);
-    gx = g_truth.gyr[0] + sim_noise(0.05f * g_truth.vib);  gy = g_truth.gyr[1] + sim_noise(0.05f * g_truth.vib);  gz = g_truth.gyr[2] + sim_noise(0.05f * g_truth.vib);
+    if (mode == FIFO_NONE) {
+      Pkt p; sample(p, g_sim_us * 1e-6);
+      ax = p.a[0]; ay = p.a[1]; az = p.a[2]; gx = p.g[0]; gy = p.g[1]; gz = p.g[2];
+      return true;
+    }
+    produce();
+    refillCheck();
+    if (count == 0) return false;
+    const Pkt &p = q[head];
+    head = (head + 1) % CAP;
+    count--;
+    ax = p.a[0]; ay = p.a[1]; az = p.a[2]; gx = p.g[0]; gy = p.g[1]; gz = p.g[2];
     return true;
   }
 };
@@ -38,6 +106,7 @@ struct SimMag {
   bool readData() {
     if (nextUs > g_sim_us) return false;
     nextUs = g_sim_us + 10000;  // 100 Hz
+    if (g_truth.truthFn) g_truth.truthFn(g_sim_us * 1e-6);
     x = g_truth.mag[0] + sim_noise(0.3f); y = g_truth.mag[1] + sim_noise(0.3f); z = g_truth.mag[2] + sim_noise(0.3f);
     return true;
   }
